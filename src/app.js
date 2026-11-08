@@ -698,7 +698,7 @@ export class App {
     const th = this.theme;
     const items = this.paletteItems();
     const pw = Math.min(56, s.w - 4);
-    const ph = 5 + Math.max(1, items.length);
+    const ph = 6 + Math.max(1, items.length);
     const x = Math.floor((s.w - pw) / 2);
     const y = Math.max(1, Math.floor((s.h - ph) / 3));
     s.rect(x, y, pw, ph, th.panel);
