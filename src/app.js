@@ -1,14 +1,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Screen, detectTruecolor, mix, BOLD, UNDERLINE } from './term.js';
-import { THEMES, MODES } from './theme.js';
-import { Logo } from './logo.js';
+import { Screen, detectTruecolor, mix, BOLD, ITALIC } from './term.js';
+import { C, MODES } from './theme.js';
+import { Cover } from './cover.js';
 import { parseKeys } from './keys.js';
 import { TextBuffer, wrapText } from './text.js';
 
 export const VERSION = '0.1.0';
-const PINK = 0xff4fa3;
 const MODEL = 'brat-1';
 
 const VERBS = [
@@ -20,22 +19,15 @@ const PLACEHOLDERS = [
   'write tests, no excuses', 'what is the tech stack of this project?',
   'explain this repo like i am five',
 ];
-const TIPS = [
-  ['tab', 'switches between brat and demure'],
-  ['ctrl+p', 'opens the command palette'],
-  ['/', 'at the start of a line opens commands'],
-  ['alt+enter', 'adds a new line, so does \\ then enter'],
-  ['up', 'brings back your previous messages'],
-  ['ctrl+c', 'clears the input, twice to quit'],
-];
-const LEVELS = [
-  ['tab', 'mode'],
-  ['ctrl+p', 'commands'],
-];
+const HINTS = [['tab', 'flip'], ['ctrl+p', 'commands']];
+const EQ = ' \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588';
+const COVER = 30;
 
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
+const pad2 = (n) => String(n).padStart(2, '0');
+const fmtDur = (ms) => `${Math.floor(ms / 60000)}:${pad2(Math.floor(ms / 1000) % 60)}`;
 
 function homeify(p) {
   const h = os.homedir();
@@ -59,8 +51,7 @@ function gitBranch(dir) {
 
 const COMMANDS = [
   { id: 'new', title: 'new session', hint: 'ctrl+n' },
-  { id: 'mode', title: 'switch mode', hint: 'tab' },
-  { id: 'theme', title: 'switch theme', hint: '' },
+  { id: 'mode', title: 'flip the record', hint: 'tab' },
   { id: 'demo', title: 'show demo session', hint: '' },
   { id: 'keys', title: 'keyboard shortcuts', hint: '' },
   { id: 'exit', title: 'exit', hint: 'ctrl+d' },
@@ -72,15 +63,16 @@ export class App {
     const cols = o.cols || this.out?.columns || 100;
     const rows = o.rows || this.out?.rows || 30;
     this.screen = new Screen(cols, rows, o.truecolor ?? detectTruecolor());
-    this.themeKey = o.theme && THEMES[o.theme] ? o.theme : 'brat';
     this.anim = o.anim !== false;
     this.clock = o.clock || (() => performance.now());
     this.cwd = o.cwd || process.cwd();
     this.dir = homeify(this.cwd);
     this.branch = gitBranch(this.cwd);
 
-    this.logo = new Logo(['brat', 'code']);
+    this.cover = new Cover({ word: 'brat', w: COVER, h: COVER });
     this.modeKey = 'brat';
+    this.prevKey = 'brat';
+    this.flipAt = -1e9;
     this.input = new TextBuffer();
     this.history = [];
     this.histIdx = -1;
@@ -92,21 +84,20 @@ export class App {
     this.toast = null;
     this.quitArm = -1e9;
     this.placeholder = o.placeholder || pick(PLACEHOLDERS);
-    this.tip = o.tip || pick(TIPS);
     this.introAt = this.clock();
     this.lastKey = -1e9;
     this.timer = null;
     this.onQuit = o.onQuit || (() => {});
   }
 
-  get theme() { return THEMES[this.themeKey]; }
   get mode() { return MODES[this.modeKey]; }
   get busy() { return this.messages.some((m) => m.role === 'bot' && !m.done); }
+  get trackNo() { return this.messages.filter((m) => m.role === 'user').length + 1; }
 
   // ---------------------------------------------------------------- lifecycle
   start() {
     const { out } = this;
-    out.write('\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h\x1b[2J');
+    out.write('\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h\x1b]0;bratcode\x07\x1b[2J');
     process.stdin.setRawMode(true);
     process.stdin.setEncoding('utf8');
     process.stdin.resume();
@@ -156,10 +147,7 @@ export class App {
     if (this.palette) return this.paletteKey(k);
     const inp = this.input;
 
-    if (k.name === 'paste') {
-      inp.insert(k.text.replace(/\r\n?/g, '\n'));
-      return;
-    }
+    if (k.name === 'paste') { inp.insert(k.text.replace(/\r\n?/g, '\n')); return; }
     if (k.ctrl) {
       switch (k.name) {
         case 'c':
@@ -185,10 +173,8 @@ export class App {
       }
     }
     switch (k.name) {
-      case 'tab': return this.cycleMode(k.shift ? -1 : 1);
-      case 'escape':
-        if (this.busy) this.stopBot();
-        return;
+      case 'tab': return this.flip(k.shift ? -1 : 1);
+      case 'escape': if (this.busy) this.stopBot(); return;
       case 'enter':
         if (k.alt || k.shift) return inp.insert('\n');
         if (inp.text.endsWith('\\')) { inp.backspace(); return inp.insert('\n'); }
@@ -227,10 +213,19 @@ export class App {
     this.input.set(this.histIdx === -1 ? this.draft : this.history[this.history.length - 1 - this.histIdx]);
   }
 
-  cycleMode(dir = 1) {
+  // tab = turn the record over: side a (brat) <-> side b (demure)
+  flip() {
     const keys = Object.keys(MODES);
-    this.modeKey = keys[(keys.indexOf(this.modeKey) + dir + keys.length) % keys.length];
-    this.say(`${this.mode.label} mode: ${this.mode.blurb}`);
+    this.prevKey = this.modeKey;
+    this.modeKey = keys[(keys.indexOf(this.modeKey) + 1) % keys.length];
+    this.flipAt = this.anim ? this.clock() : -1e9;
+    if (this.view === 'chat') this.say(`side ${this.mode.side}: ${this.mode.label}, ${this.mode.blurb}`);
+  }
+
+  // color of the accent right now (cross-fades while flipping)
+  accent(now) {
+    const t = clamp((now - this.flipAt) / 360, 0, 1);
+    return mix(MODES[this.prevKey].color, this.mode.color, t);
   }
 
   openPalette(query) { this.palette = { query, sel: 0 }; }
@@ -270,17 +265,9 @@ export class App {
         this.view = 'home';
         this.input.clear();
         this.introAt = this.clock();
-        this.tip = pick(TIPS);
         this.placeholder = pick(PLACEHOLDERS);
         break;
-      case 'mode': this.cycleMode(1); break;
-      case 'theme': {
-        const keys = Object.keys(THEMES);
-        this.themeKey = keys[(keys.indexOf(this.themeKey) + 1) % keys.length];
-        this.screen.invalidate();
-        this.say(`theme: ${this.themeKey}`);
-        break;
-      }
+      case 'mode': this.flip(); break;
       case 'demo': this.demo(); break;
       case 'keys': this.help(); break;
       case 'exit': this.quit(); break;
@@ -294,7 +281,7 @@ export class App {
     if (!text) return;
     if (text.startsWith('/')) {
       const id = text.slice(1).split(/\s+/)[0].toLowerCase();
-      const alias = { help: 'keys', quit: 'exit', q: 'exit', clear: 'new' }[id] || id;
+      const alias = { help: 'keys', quit: 'exit', q: 'exit', clear: 'new', flip: 'mode' }[id] || id;
       if (COMMANDS.some((c) => c.id === alias)) {
         this.input.clear();
         return this.run(alias);
@@ -314,29 +301,31 @@ export class App {
     const now = this.clock();
     const echo = text.replace(/\s+/g, ' ').slice(0, 64);
     const brat = this.modeKey === 'brat';
-    this.messages.push({ role: 'user', text, mode: this.modeKey });
-    this.messages.push({
+    const user = { role: 'user', text, mode: this.modeKey };
+    const bot = {
       role: 'bot',
       mode: this.modeKey,
       steps: [brat
         ? { label: 'checked the vibe', detail: '0 files, 0 problems' }
         : { label: 'planned very mindfully', detail: '1 step' }],
       text: brat
-        ? `heyyy. i am only the pretty part for now. nothing is connected yet, so i cannot touch your code.\n\nbut i heard you: "${echo}". the real stuff drops soon. stay brat.`
-        : `very mindful, very demure. i am just a design right now, so i will not touch your files.\n\nyou said "${echo}". i noted it. functionality comes later. very cutesy.`,
+        ? `heyyy. i am only the cover for now: no band, no brain yet. nothing is connected, so i cannot touch your code.\n\nbut i heard you: "${echo}". the real tracks drop soon. stay brat.`
+        : `very mindful. i am just the sleeve for now, so i will not touch your files.\n\nyou said "${echo}". noted, very quietly. the real music comes later.`,
       t0: now,
       thinkMs: this.anim ? 1100 + Math.random() * 700 : 0,
       cps: this.anim ? 80 : 1e6,
       verb: pick(VERBS),
       done: false,
-    });
+    };
+    user.bot = bot;
+    this.messages.push(user, bot);
   }
 
   demo() {
     const now = this.clock();
     this.view = 'chat';
     this.scroll = 0;
-    this.messages.push({ role: 'user', text: 'make the vibes more brat, please', mode: this.modeKey });
+    const user = { role: 'user', text: 'make the vibes more brat, please', mode: this.modeKey };
     const bot = {
       role: 'bot',
       mode: this.modeKey,
@@ -351,8 +340,8 @@ export class App {
       verb: pick(VERBS),
       done: false,
     };
-    this.messages.push(bot);
-    this.messages.push({
+    user.bot = bot;
+    this.messages.push(user, bot, {
       role: 'diff',
       after: bot,
       file: 'src/vibes.ts',
@@ -377,7 +366,7 @@ export class App {
       text: [
         'enter          send',
         'alt+enter      new line (or \\ then enter)',
-        'tab            switch mode: brat / demure',
+        'tab            flip the record: side a brat / side b demure',
         'ctrl+p or /    command palette',
         'up / down      message history',
         'pgup / pgdn    scroll',
@@ -393,11 +382,13 @@ export class App {
   }
 
   stopBot() {
+    const now = this.clock();
     for (const m of this.messages) {
       if (m.role === 'bot' && !m.done) {
-        m.cut = Math.max(0, this.botShown(m, this.clock()));
+        m.cut = Math.max(0, this.botShown(m, now));
         m.done = true;
         m.stopped = true;
+        m.dur = now - m.t0;
       }
     }
   }
@@ -411,7 +402,10 @@ export class App {
   tick(now) {
     for (const m of this.messages) {
       if (m.role !== 'bot' || m.done) continue;
-      if (this.botShown(m, now) >= m.text.length) m.done = true;
+      if (this.botShown(m, now) >= m.text.length) {
+        m.done = true;
+        m.dur = m.thinkMs + (m.steps.length ? 350 : 0) + (m.text.length / m.cps) * 1000;
+      }
     }
     if (this.toast && now > this.toast.until) this.toast = null;
   }
@@ -419,18 +413,15 @@ export class App {
   // ---------------------------------------------------------------- drawing
   draw() {
     const s = this.screen;
-    const th = this.theme;
     const now = this.clock();
     this.tick(now);
-    s.clear(th.bg, th.fg);
+    s.clear(C.bg, C.fg);
     if (this.view === 'home') this.drawHome(now);
     else this.drawChat(now);
-    this.drawStatus();
     this.drawToast(now);
-    if (this.palette) { this.scrim(0.62); this.drawPalette(now); }
+    if (this.palette) { this.scrim(0.6); this.drawPalette(now); }
   }
 
-  // dim everything behind a modal
   scrim(a) {
     const s = this.screen;
     for (let k = 0; k < s.bg.length; k++) {
@@ -439,198 +430,219 @@ export class App {
     }
   }
 
-  barColor(modeKey) {
-    return modeKey === 'brat' ? this.theme.bar : MODES[modeKey].color;
-  }
-
-  inputLayout(pw) {
-    const tw = Math.max(8, pw - 6);
-    const { rows, cur } = this.input.layout(tw);
-    const shown = Math.min(rows.length, 6);
+  inputLayout(tw) {
+    const { rows, cur } = this.input.layout(Math.max(8, tw));
+    const shown = Math.min(rows.length, 5);
     const first = clamp(cur.row - shown + 1, 0, rows.length - shown);
-    return { rows, cur, shown, first, ph: shown + 4 };
+    return { rows, cur, shown, first };
   }
 
-  drawInput(x, y, pw, now) {
+  // "01  ask anything..." : every message you write is the next track
+  drawInput(x, y, w, now, color) {
     const s = this.screen;
-    const th = this.theme;
-    const L = this.inputLayout(pw);
-    const bar = this.barColor(this.modeKey);
-    s.rect(x, y, pw, L.ph, th.panel);
-    for (let j = 0; j < L.ph; j++) s.put(x, y + j, '\u258c', bar, th.panel);
-
-    const tx = x + 3;
-    const ty = y + 1;
-    const maxX = x + pw - 2;
-    const empty = this.input.empty;
-    if (empty) {
-      s.text(tx, ty, `ask anything... "${this.placeholder}"`, th.panelDim, th.panel, 0, maxX);
+    const L = this.inputLayout(w - 4);
+    const no = pad2(this.trackNo);
+    const ph = `ask anything... "${this.placeholder}"`;
+    const maxX = x + w;
+    s.text(x, y, no, color, -1, BOLD);
+    if (this.input.empty) {
+      s.text(x + 4, y, ph, C.dim, -1, 0, maxX);
     } else {
-      for (let j = 0; j < L.shown; j++) s.text(tx, ty + j, L.rows[L.first + j], th.panelFg, th.panel, 0, maxX);
+      for (let j = 0; j < L.shown; j++) s.text(x + 4, y + j, L.rows[L.first + j], C.fg, -1, 0, maxX);
     }
     if (!this.palette) {
       const on = !this.anim || now - this.lastKey < 600 || Math.floor(now / 530) % 2 === 0;
       if (on) {
-        const cx = tx + L.cur.col;
-        const cy = ty + L.cur.row - L.first;
-        const under = empty ? `ask anything... "${this.placeholder}"`[0] : (L.rows[L.cur.row] || '')[L.cur.col] || ' ';
-        s.put(cx, cy, under, th.panel, th.cursor ?? th.panelFg);
+        const under = this.input.empty ? ph[0] : (L.rows[L.cur.row] || '')[L.cur.col] || ' ';
+        s.put(x + 4 + L.cur.col, y + L.cur.row - L.first, under, C.bg, color);
       }
     }
+    return L.shown;
+  }
 
-    const my = y + L.shown + 2;
-    let nx = s.text(tx, my, this.mode.label, this.mode.color, th.panel, BOLD, maxX);
-    nx = s.text(nx, my, ' \u00b7 ', th.panelDim, th.panel, 0, maxX);
-    nx = s.text(nx, my, MODEL, th.panelFg, th.panel, 0, maxX);
-    s.text(nx, my, ' preview', th.panelDim, th.panel, 0, maxX);
-    if (this.busy) {
-      const t = 'esc to stop';
-      s.text(x + pw - 2 - t.length, my, t, th.panelDim, th.panel);
+  // the line under the input is also the player bar:
+  // idle = a short green stub, thinking = a sweeping segment, replying = it fills up
+  drawBar(x, y, w, now, color) {
+    const s = this.screen;
+    for (let i = 0; i < w; i++) s.put(x + i, y, '\u2500', C.faint);
+    const bot = this.messages.find((m) => m.role === 'bot' && !m.done);
+    if (!bot) {
+      for (let i = 0; i < 4; i++) s.put(x + i, y, '\u2501', color);
+      return;
     }
-    return L.ph;
+    const shown = this.botShown(bot, now);
+    if (shown < 0) {
+      const len = 8;
+      const pos = Math.round(((Math.sin((now / 1000) * 3.4 - 1.57) + 1) / 2) * (w - len));
+      for (let i = 0; i < len; i++) s.put(x + pos + i, y, '\u2501', mix(C.faint, color, Math.sin((Math.PI * (i + 0.5)) / len)));
+      return;
+    }
+    const fill = Math.round(clamp(shown / Math.max(1, bot.text.length), 0, 1) * w);
+    for (let i = 0; i < fill; i++) s.put(x + i, y, '\u2501', color);
+    s.put(x + Math.min(w - 1, fill), y, '\u2501', C.fg);
   }
 
   drawHints(xRight, y) {
     const s = this.screen;
-    const th = this.theme;
-    const items = this.busy ? [['esc', 'stop'], ['ctrl+p', 'commands']] : LEVELS;
-    let len = 0;
+    const items = this.busy ? [['esc', 'stop'], ['ctrl+p', 'commands']] : HINTS;
+    let len = -3;
     for (const [k, l] of items) len += k.length + 1 + l.length + 3;
-    len -= 3;
     let x = xRight - len;
     items.forEach(([k, l], i) => {
-      x = s.text(x, y, k, th.fg, -1, BOLD);
-      x = s.text(x, y, ' ' + l, th.dim);
+      x = s.text(x, y, k, C.fg, -1, BOLD);
+      x = s.text(x, y, ' ' + l, C.dim);
       if (i < items.length - 1) x += 3;
     });
   }
 
-  drawHome(now) {
+  drawChips(x, y, now) {
     const s = this.screen;
-    const th = this.theme;
-    const { w, h } = s;
-    const compact = w < this.logo.w + 2 || h < 22;
-    const pw = Math.min(80, w - 6);
-    const logoRows = compact ? 1 : this.logo.rows;
-    const total = logoRows + (compact ? 2 : 1) + 5 + 1;
-    const top = Math.max(0, Math.floor((h - 1 - total) / 2) - (compact ? 0 : 1));
-    const px = Math.floor((w - pw) / 2);
-
-    // focus-pull intro: both words start blurry, "code" snaps into focus, "brat" never does.
-    const p = this.anim ? clamp((now - this.introAt) / 1900, 0, 1) : 1;
-    const ease = 1 - (1 - p) ** 3;
-    const fade = this.anim ? clamp((now - this.introAt) / 450, 0, 1) : 1;
-    const breath = this.anim ? Math.sin(now / 1000 * 1.1) * 0.18 * ease : 0;
-    const sBrat = lerp(3.2, 0.62, ease) + breath * 0.5;
-    const sCode = lerp(3.2, 0, ease);
-    if (compact) {
-      const t = 'bratcode';
-      const x = Math.floor((w - t.length) / 2);
-      s.text(x, top, 'brat', th.logoA, -1, BOLD | UNDERLINE);
-      s.text(x + 4, top, 'code', th.logoB, -1, BOLD);
-    } else {
-      this.logo.draw(
-        s, Math.floor((w - this.logo.w) / 2), top, [sBrat, sCode], th.bg,
-        [mix(th.bg, th.logoA, fade), mix(th.bg, th.logoB, fade)],
-      );
-    }
-    const py = top + logoRows + (compact ? 1 : 0);
-    const ph = this.drawInput(px, py, pw, now);
-    this.drawHints(px + pw, py + ph);
-
-    const tipY = Math.max(py + ph + 3, h - 5);
-    if (tipY < h - 2 && w >= 44) {
-      const [k, t] = this.tip;
-      const len = 6 + k.length + 1 + t.length;
-      let x = Math.floor((w - len) / 2);
-      x = s.text(x, tipY, '\u25cf ', th.fg);
-      x = s.text(x, tipY, 'tip ', th.fg, -1, BOLD);
-      x = s.text(x, tipY, k, th.fg, -1, BOLD);
-      s.text(x, tipY, ' ' + t, th.dim);
+    for (const m of Object.values(MODES)) {
+      const on = m.id === this.modeKey;
+      const label = ` ${m.side.toUpperCase()} ${m.label} `;
+      const bg = on ? mix(MODES[this.prevKey].id === m.id ? MODES[this.prevKey].color : m.color, m.color, clamp((now - this.flipAt) / 360, 0, 1)) : -1;
+      x = s.text(x, y, label, on ? C.bg : C.dim, bg, on ? BOLD : 0);
+      x += 1;
     }
   }
 
-  wave(x, y, now, n = 6) {
+  drawHome(now) {
     const s = this.screen;
-    const th = this.theme;
+    const { w, h } = s;
+    const wide = w >= 80 && h >= 20;
+    const rows = COVER / 2;
+    const rw = wide ? Math.min(60, w - COVER - 10) : Math.min(60, w - 4);
+    const blockW = wide ? COVER + 4 + rw : rw;
+    const bx = Math.floor((w - blockW) / 2);
+    const by = Math.max(1, Math.floor(((wide ? h - 1 : h - 3) - (wide ? rows : 10)) / 2));
+    const rx = wide ? bx + COVER + 4 : bx;
+    const ry = wide ? by : by;
+    const color = this.accent(now);
+
+    const t = (now - this.introAt) / 1000;
+    const fade = (delay, dur = 0.5) => (this.anim ? clamp((t - delay) / dur, 0, 1) : 1);
+    const fadeTo = (c, d) => mix(C.bg, c, fade(d));
+
+    if (wide) {
+      // intro: out-of-focus cover pulls into focus. side a never fully does, side b does.
+      const p = this.anim ? clamp(t / 1.9, 0, 1) : 1;
+      const ease = 1 - (1 - p) ** 3;
+      const q = clamp((now - this.flipAt) / 560, 0, 1);
+      const flipping = q < 1;
+      const side = flipping && q < 0.5 ? MODES[this.prevKey] : this.mode;
+      const sharp = side.id === 'demure';
+      const target = sharp ? 0 : 0.9 + (this.anim ? Math.sin(now / 1000 * 1.1) * 0.12 * ease : 0);
+      this.cover.draw(s, bx, by, {
+        color: mix(C.bg, side.color, fade(0, 0.45)),
+        ink: C.bg,
+        sigma: lerp(3.4, target, ease),
+        scaleX: flipping ? Math.abs(Math.cos(Math.PI * q)) : 1,
+      });
+    }
+
+    // right column
+    let y = ry;
+    if (!wide) {
+      s.text(rx, y, 'bratcode', mix(C.bg, C.fg, fade(0)), -1, BOLD);
+      y += 2;
+    } else {
+      let x = s.text(rx, y, 'bratcode', fadeTo(C.fg, 0.35), -1, BOLD);
+      s.text(x + 2, y, VERSION, fadeTo(C.dim, 0.35));
+      y += 1;
+    }
+    {
+      const x = s.text(rx, y, `side ${this.mode.side} `, mix(C.bg, color, fade(0.45)), -1, BOLD);
+      s.text(x, y, `\u00b7 ${this.mode.blurb}`, fadeTo(C.dim, 0.45));
+    }
+    // wide: title on top of the sleeve, input at the bottom, like credits on a back cover
+    const iy = ry + (wide ? rows - 6 : 3);
+    const n = this.drawInput(rx, iy, rw, now, color);
+    this.drawBar(rx, iy + n, rw, now, color);
+    this.drawChips(rx, iy + n + 2, now);
+    if (wide) this.drawHints(rx + rw, ry + rows - 1);
+    else this.drawHints(rx + rw, iy + n + 4);
+    s.text(2, h - 1, this.dir + (this.branch ? `:${this.branch}` : ''), C.faint, -1, 0, w - 4);
+  }
+
+  eq(x, y, now, color, n = 5) {
+    const s = this.screen;
     for (let i = 0; i < n; i++) {
-      const v = (Math.sin(now / 1000 * 7 - i * 0.85) + 1) / 2;
-      s.put(x + i, y, ' ', th.fg, mix(th.bg, th.fg, v ** 1.4 * 0.85));
+      const v = (Math.sin((now / 1000) * 9 + i * 1.7) + Math.sin((now / 1000) * 5.3 + i * 2.9)) / 4 + 0.5;
+      s.put(x + i, y, EQ[1 + Math.round(clamp(v, 0, 1) * 7)], color);
     }
     return x + n;
   }
 
   buildLines(cw, mx, now) {
     const s = this.screen;
-    const th = this.theme;
     const lines = [];
     const blank = () => lines.push(() => {});
+    let n = 0;
     for (const m of this.messages) {
       if (m.role === 'user') {
-        const bar = this.barColor(m.mode);
-        const tw = cw - 6;
-        const rows = wrapText(m.text, tw);
-        const panel = (y, txt) => {
-          s.rect(mx, y, cw, 1, th.panel);
-          s.put(mx, y, '\u258c', bar, th.panel);
-          if (txt) s.text(mx + 3, y, txt, th.panelFg, th.panel, 0, mx + cw - 2);
-        };
-        lines.push((y) => panel(y));
-        for (const r of rows) lines.push((y) => panel(y, r));
-        lines.push((y) => panel(y));
-        blank();
-      } else if (m.role === 'bot') {
-        const md = MODES[m.mode];
-        const label = ` ${md.label} `;
-        lines.push((y) => s.text(mx, y, label, md.color, th.panel, BOLD));
-        const el = now - m.t0;
-        const shown = m.done && !m.stopped ? m.text.length : m.stopped ? m.cut : this.botShown(m, now);
-        const thinking = !m.done && shown < 0;
-        if (thinking) {
+        n++;
+        const no = n;
+        const color = MODES[m.mode].color;
+        wrapText(m.text, cw - 12).forEach((r, i) => {
           lines.push((y) => {
-            let x = this.wave(mx + 2, y, now);
-            x = s.text(x + 1, y, m.verb, th.fg);
-            s.text(x + 1, y, `${(el / 1000).toFixed(1)}s`, th.dim);
+            if (i === 0) {
+              s.text(mx, y, pad2(no), color, -1, BOLD);
+              if (m.bot?.done) {
+                const d = fmtDur(m.bot.dur);
+                s.text(mx + cw - d.length, y, d, C.dim);
+              }
+            }
+            s.text(mx + 4, y, r, C.fg, -1, BOLD, mx + cw - 8);
+          });
+        });
+      } else if (m.role === 'bot') {
+        const color = MODES[m.mode].color;
+        const shown = m.done && !m.stopped ? m.text.length : m.stopped ? m.cut : this.botShown(m, now);
+        if (!m.done && shown < 0) {
+          lines.push((y) => {
+            const x = this.eq(mx + 4, y, now, color);
+            const x2 = s.text(x + 2, y, m.verb, C.text);
+            s.text(x2 + 2, y, `${((now - m.t0) / 1000).toFixed(1)}s`, C.dim);
           });
         } else {
           for (const st of m.steps) {
             lines.push((y) => {
-              let x = s.text(mx + 2, y, '\u2713', th.fg, -1, BOLD);
-              x = s.text(x + 1, y, st.label, th.fg);
-              s.text(x + 2, y, st.detail, th.dim);
+              let x = s.text(mx + 4, y, '\u2713', color, -1, BOLD);
+              x = s.text(x + 1, y, st.label, C.text);
+              s.text(x + 2, y, st.detail, C.dim);
             });
           }
           if (m.steps.length) blank();
-          const body = wrapText(m.text.slice(0, Math.max(0, shown)), cw - 4);
+          const body = wrapText(m.text.slice(0, Math.max(0, shown)), cw - 8);
           body.forEach((r, i) => {
             const last = i === body.length - 1;
             lines.push((y) => {
-              const x = s.text(mx + 2, y, r, th.fg);
-              if (last && !m.done) s.put(x, y, ' ', th.fg, th.fg);
+              const x = s.text(mx + 4, y, r, C.text);
+              if (last && !m.done) s.put(x, y, ' ', C.fg, color);
             });
           });
-          if (m.stopped) lines.push((y) => s.text(mx + 2, y, 'stopped.', th.dim, -1, ITALIC_FLAG));
+          if (m.stopped) lines.push((y) => s.text(mx + 4, y, 'stopped.', C.dim, -1, ITALIC));
         }
         blank();
       } else if (m.role === 'diff') {
         if (!m.after.done) continue;
-        const dw = cw - 2;
-        const dx = mx + 2;
+        const dx = mx + 4;
+        const dw = cw - 6;
         lines.push((y) => {
-          s.rect(dx, y, dw, 1, th.panel);
-          s.text(dx + 2, y, m.file, th.panelFg, th.panel, BOLD);
+          s.rect(dx, y, dw, 1, C.panel);
+          s.text(dx + 2, y, m.file, C.fg, C.panel, BOLD);
         });
         for (const [no, kind, txt] of m.rows) {
           lines.push((y) => {
-            const bg = kind === '+' ? mix(th.panel, 0x8ace00, 0.2) : kind === '-' ? mix(th.panel, PINK, 0.22) : th.panel;
-            const sign = kind === '+' ? 0x8ace00 : kind === '-' ? PINK : th.panelDim;
+            const bg = kind === '+' ? mix(C.panel, C.green, 0.2) : kind === '-' ? mix(C.panel, C.hot, 0.22) : C.panel;
+            const sign = kind === '+' ? C.green : kind === '-' ? C.hot : C.dim;
             s.rect(dx, y, dw, 1, bg);
-            s.text(dx + 2, y, String(no).padStart(2), th.panelDim, bg);
+            s.text(dx + 2, y, String(no).padStart(2), C.dim, bg);
             s.text(dx + 5, y, kind, sign, bg, BOLD);
-            s.text(dx + 7, y, txt, th.panelFg, bg, 0, dx + dw - 1);
+            s.text(dx + 7, y, txt, C.fg, bg, 0, dx + dw - 1);
           });
         }
-        lines.push((y) => s.rect(dx, y, dw, 1, th.panel));
+        lines.push((y) => s.rect(dx, y, dw, 1, C.panel));
         blank();
       }
     }
@@ -639,26 +651,25 @@ export class App {
 
   drawChat(now) {
     const s = this.screen;
-    const th = this.theme;
     const { w, h } = s;
-    const cw = Math.min(100, w - 4);
+    const cw = Math.min(96, w - 6);
     const mx = Math.floor((w - cw) / 2);
-    const L = this.inputLayout(cw);
-    const panelY = h - 2 - L.ph;
+    const color = this.accent(now);
+    const L = this.inputLayout(cw - 4);
+    const barY = h - 2;
+    const inputY = barY - L.shown;
 
-    // header
-    s.text(mx, 0, ' bratcode ', th.panelFg, th.panel, BOLD);
+    // header: bratcode / first prompt ............ [ A brat ]
+    s.text(mx, 1, 'bratcode', C.fg, -1, BOLD);
     const first = this.messages.find((m) => m.role === 'user');
-    if (first) {
-      const t = first.text.replace(/\s+/g, ' ');
-      s.text(mx + 12, 0, t, th.dim, -1, 0, mx + cw - 14);
-    }
-    s.text(mx + cw - this.modeKey.length - 1, 0, this.mode.label, this.mode.color === 0x8ace00 ? th.fg : this.mode.color, -1, BOLD);
+    if (first) s.text(mx + 11, 1, first.text.replace(/\s+/g, ' '), C.dim, -1, 0, mx + cw - 16);
+    const chip = ` ${this.mode.side.toUpperCase()} ${this.mode.label} `;
+    s.text(mx + cw - chip.length, 1, chip, C.bg, color, BOLD);
 
-    const top = 2;
-    const area = Math.max(1, panelY - 1 - top);
+    const top = 3;
+    const bottom = inputY - 2;
+    const area = Math.max(1, bottom - top + 1);
     const lines = this.buildLines(cw, mx, now);
-    while (lines.length && lines[lines.length - 1].length === 0 && lines.length > 0 && false) lines.pop();
     const maxScroll = Math.max(0, lines.length - area);
     this.scroll = clamp(this.scroll, 0, maxScroll);
     const end = lines.length - this.scroll;
@@ -666,59 +677,48 @@ export class App {
     for (let i = start; i < end; i++) lines[i](top + i - start);
     if (this.scroll > 0) {
       const t = ` ${this.scroll} more below `;
-      s.text(mx + cw - t.length, panelY - 1, t, th.panelFg, th.panel);
+      s.text(mx + cw - t.length, bottom + 1, t, C.bg, C.dim);
     }
 
-    this.drawInput(mx, panelY, cw, now);
-    this.drawHints(mx + cw, panelY + L.ph);
-  }
-
-  drawStatus() {
-    const s = this.screen;
-    const th = this.theme;
-    const y = s.h - 1;
-    const left = this.dir + (this.branch ? `:${this.branch}` : '');
-    s.text(2, y, left, th.dim, -1, 0, s.w - 14);
-    const v = `bratcode ${VERSION}`;
-    s.text(s.w - 2 - v.length, y, v, th.dim);
+    this.drawInput(mx, inputY, cw, now, color);
+    this.drawBar(mx, barY, cw, now, color);
+    s.text(mx, h - 1, this.dir + (this.branch ? `:${this.branch}` : ''), C.faint, -1, 0, mx + cw - 30);
+    this.drawHints(mx + cw, h - 1);
   }
 
   drawToast(now) {
     if (!this.toast) return;
     const s = this.screen;
-    const th = this.theme;
     const t = ` ${this.toast.text} `;
-    const x = s.w - t.length - 2;
     const left = this.toast.until - now;
-    s.text(x, 1, t, left < 400 ? th.panelDim : th.panelFg, th.panel);
+    const cw = Math.min(96, s.w - 6);
+    const x = Math.floor((s.w - cw) / 2) + cw - t.length;
+    s.text(x, 2, t, left < 400 ? C.dim : C.fg, C.panel);
   }
 
   drawPalette(now) {
     const s = this.screen;
-    const th = this.theme;
     const items = this.paletteItems();
     const pw = Math.min(56, s.w - 4);
     const ph = 6 + Math.max(1, items.length);
     const x = Math.floor((s.w - pw) / 2);
     const y = Math.max(1, Math.floor((s.h - ph) / 3));
-    s.rect(x, y, pw, ph, th.panel);
-    s.text(x + 3, y + 1, 'commands', th.accent, th.panel, BOLD);
-    s.text(x + pw - 6, y + 1, 'esc', th.panelDim, th.panel);
+    const color = this.mode.color;
+    s.rect(x, y, pw, ph, C.panel);
+    s.text(x + 3, y + 1, 'commands', color, C.panel, BOLD);
+    s.text(x + pw - 6, y + 1, 'esc', C.dim, C.panel);
     const q = this.palette.query;
-    let cx = s.text(x + 3, y + 3, q || '', th.panelFg, th.panel);
-    if (!q) s.text(x + 3, y + 3, 'type to filter', th.panelDim, th.panel);
+    const cx = s.text(x + 3, y + 3, q, C.fg, C.panel);
+    if (!q) s.text(x + 3, y + 3, 'type to filter', C.dim, C.panel);
     const on = !this.anim || now - this.lastKey < 600 || Math.floor(now / 530) % 2 === 0;
-    if (on) s.put(cx, y + 3, !q ? 't' : ' ', th.panel, th.panelFg);
-    if (!items.length) s.text(x + 3, y + 5, 'nothing here, bestie', th.panelDim, th.panel);
+    if (on) s.put(cx, y + 3, !q ? 't' : ' ', C.bg, color);
+    if (!items.length) s.text(x + 3, y + 5, 'nothing here, bestie', C.dim, C.panel);
     items.forEach((it, i) => {
       const sel = i === this.palette.sel;
-      const bg = sel ? th.accent : th.panel;
+      const bg = sel ? color : C.panel;
       s.rect(x + 1, y + 5 + i, pw - 2, 1, bg);
-      s.text(x + 3, y + 5 + i, it.title, sel ? th.accentFg : th.panelFg, bg, sel ? BOLD : 0);
-      const hint = it.id === 'theme' ? this.themeKey : it.hint;
-      if (hint) s.text(x + pw - 3 - hint.length, y + 5 + i, hint, sel ? th.accentFg : th.panelDim, bg);
+      s.text(x + 3, y + 5 + i, it.title, sel ? C.bg : C.fg, bg, sel ? BOLD : 0);
+      if (it.hint) s.text(x + pw - 3 - it.hint.length, y + 5 + i, it.hint, sel ? C.bg : C.dim, bg);
     });
   }
 }
-
-const ITALIC_FLAG = 4;

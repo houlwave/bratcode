@@ -19,7 +19,6 @@ if (has('-h', '--help')) {
 
   ${B}usage${R}
     bratcode                 start
-    bratcode --theme dark    brat | dark
     bratcode --no-anim       turn off animations
     bratcode --version
 
@@ -27,7 +26,7 @@ if (has('-h', '--help')) {
     BRATCODE_COLORS=256      force 256 colors (for terminals without truecolor)
 
   ${B}inside${R}
-    tab mode   ctrl+p commands   / palette   ctrl+c twice to quit
+    tab flip the record   ctrl+p commands   / palette   ctrl+c twice to quit
 `);
   process.exit(0);
 }
@@ -37,8 +36,5 @@ if (!process.stdin.isTTY || !process.stdout.isTTY) {
   process.exit(1);
 }
 
-const ti = args.indexOf('--theme');
-const theme = ti >= 0 ? args[ti + 1] : undefined;
-
 const { App } = await import('../src/app.js');
-new App({ theme, anim: !has('--no-anim') }).start();
+new App({ anim: !has('--no-anim') }).start();
