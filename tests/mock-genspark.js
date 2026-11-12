@@ -35,6 +35,10 @@ export async function startMock(accounts) {
       let payload = {}; try { payload = JSON.parse(body); } catch { /* ignore */ }
       hits.ask.push({ sid, payload });
       if (!acc) { res.writeHead(401); return res.end('not login'); }
+      if (acc.rawResponse) {
+        res.writeHead(acc.rawResponse.status, acc.rawResponse.headers);
+        return res.end(acc.rawResponse.body);
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       const ev = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
       const pid = payload.project_id || 'proj-1';

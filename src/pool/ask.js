@@ -46,6 +46,47 @@ function buildHeaders() {
   return h;
 }
 
+// Error pages are not assistant messages. Keep diagnostic reads bounded and never
+// expose HTML (challenge tokens/scripts, or terminal control characters) in the TUI.
+async function readErrorBody(res, limit = 16384) {
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const parts = [];
+  let size = 0;
+  try {
+    while (size < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const part = value.subarray(0, limit - size);
+      parts.push(Buffer.from(part)); size += part.length;
+    }
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  return Buffer.concat(parts).toString('utf8');
+}
+
+async function validateStreamResponse(r) {
+  const type = (r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  const challenged = r.headers.get('cf-mitigated')?.toLowerCase() === 'challenge';
+  if (!challenged && r.status < 400 && type === 'text/event-stream' && r.res.body) return;
+  const text = await readErrorBody(r.res);
+  const html = /(?:<!doctype\s+html|<html\b|<script\b|<head\b|<body\b)/i.test(text) || type === 'text/html';
+  if (challenged || (html && /_cf_chl_opt|\/cdn-cgi\/challenge-platform|enable javascript and cookies|just a moment/i.test(text))) {
+    throw Object.assign(new Error('Cloudflare blocked the message with a browser verification. Open /accounts and sign in again using the browser window (a), then retry manually. If it persists, retry later. The saved account has not been marked invalid.'), {
+      code: 'cloudflare-challenge', statusCode: r.status,
+    });
+  }
+  if (r.status >= 400) {
+    const detail = html ? 'server returned an HTML error page' : text.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 4000);
+    throw Object.assign(new Error(`HTTP ${r.status}: ${detail}`), {
+      statusCode: r.status, responseBody: html ? '' : text,
+      creditExhausted: r.status === 402 || (!html && cfg.looksCreditExhausted(text)),
+    });
+  }
+  throw Object.assign(new Error('Genspark returned an unexpected response instead of an SSE stream. Retry later; if this persists, sign in again via /accounts.'), {
+    code: 'invalid-stream-response', statusCode: r.status,
+  });
+}
+
 /**
  * handlers: onDelta({kind,delta,text,replace}) onSteps(steps) onStatus(patch) onMeta({kind}) onEvent(ev,state)
  * returns { promise, abort, payload }
@@ -60,13 +101,8 @@ export function askStream(jar, opts, handlers = {}) {
     const r = await gsRequest(jar, { method: 'POST', path: cfg.ASK_PATH, headers: buildHeaders(), body, timeoutMs: 0, signal: ctl.signal, stream: true });
     h.onMeta?.({ kind: 'response', status: r.status });
     if (r.creditRedirect) { const e = new Error('CREDIT_EXHAUSTED: redirect'); e.creditExhausted = true; e.statusCode = 402; throw e; }
-    if (r.status >= 400) {
-      const errBody = await r.res.text().catch(() => '');
-      const err = new Error('HTTP ' + r.status + ': ' + errBody.slice(0, 4000));
-      err.statusCode = r.status; err.responseBody = errBody;
-      if (cfg.looksCreditExhausted(errBody) || r.status === 402) err.creditExhausted = true;
-      throw err;
-    }
+    try { await validateStreamResponse(r); }
+    catch (err) { if (r.timer) clearTimeout(r.timer); throw err; }
 
     let creditExhausted = false, creditNote = '', lastTextMsgId = '';
     const result = {
@@ -154,6 +190,9 @@ export function askStream(jar, opts, handlers = {}) {
 
     finalize();
     h.onMeta?.({ kind: 'end' });
+    if (!aborted && result.rawEvents === 0) {
+      throw Object.assign(new Error('Genspark returned an empty or invalid SSE stream. Retry the message manually.'), { code: 'invalid-stream-response' });
+    }
     if (creditExhausted && !aborted) {
       result.content = cfg.stripCreditNotice(result.content);
       const err = new Error('CREDIT_EXHAUSTED: ' + (creditNote || 'credits exhausted'));

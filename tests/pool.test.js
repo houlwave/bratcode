@@ -8,6 +8,7 @@ import { AccountStore } from '../src/pool/accounts.js';
 import { Pool } from '../src/pool/pool.js';
 import { Runner, buildAgentPrompt } from '../src/pool/runner.js';
 import { createSseParser } from '../src/pool/sse-parser.js';
+import { askStream } from '../src/pool/ask.js';
 import { parseMemberBenefits, isModelLockedFor, modelKey } from '../src/pool/model-access.js';
 import { looksCreditExhaustedStrict, stripCreditNotice } from '../src/pool/config.js';
 import { parseModelId, resolveModelId, buildCatalog } from '../src/pool/models.js';
@@ -375,6 +376,81 @@ await test('RUN: one request, answer arrives, BALANCE TRIGGER #2 fires right aft
   eq(mock.hits.ask[0].payload.type, 'ai_chat');
   eq(mock.hits.ask[0].payload.ai_chat_enable_search, true);
   delete accountsDef.B.spend;
+});
+
+await test('send: Cloudflare challenges never leak HTML, rotate accounts, or invalidate the session', async () => {
+  const { pool, store, ids } = mkPool(['A', 'B']);
+  await pool.refreshAll();
+  const fixtures = [
+    { status: 403, headers: { 'content-type': 'text/html', 'cf-mitigated': 'challenge' }, body: '<html><script>window._cf_chl_opt = { secret: "challenge-token" }</script></html>' },
+    { status: 200, headers: { 'content-type': 'text/html' }, body: '<!DOCTYPE html><title>Just a moment...</title><script>window._cf_chl_opt={}</script>' },
+    { status: 503, headers: { 'content-type': 'text/html' }, body: '<html>Enable JavaScript and cookies to continue</html>' },
+    { status: 403, headers: { 'cf-mitigated': 'challenge' }, body: 'verification required' },
+  ];
+  try {
+    for (const fixture of fixtures) {
+      accountsDef.B.rawResponse = fixture;
+      const runner = new Runner({ pool });
+      const chunks = [], failures = [], done = [];
+      runner.on('chunk', (c) => chunks.push(c));
+      runner.on('failed', (e) => failures.push(e));
+      runner.on('done', (r) => done.push(r));
+      mock.hits.ask.length = 0;
+      let error;
+      try { await runner.ask({ text: 'hello' }); } catch (e) { error = e; }
+      await runner.settle();
+      eq(error.code, 'cloudflare-challenge'); eq(error.statusCode, fixture.status);
+      has(error.message, '/accounts'); ok(!/script|challenge-token|<html/i.test(error.message));
+      ok(!error.responseBody); ok(!error.creditExhausted);
+      eq(chunks, []); eq(done, []); eq(failures.length, 1);
+      eq(mock.hits.ask.length, 1, 'no replay on other accounts');
+      eq(mock.hits.ask[0].sid, 'B'); eq(runner.busy, false); eq(runner.history, []);
+      ok(!store.get(ids.B).dead); eq(store.get(ids.B).tokens, accountsDef.B.tokens);
+    }
+  } finally { delete accountsDef.B.rawResponse; }
+});
+
+await test('send: unexpected HTTP 200 bodies and empty SSE are errors, not blank successful answers', async () => {
+  const { pool } = mkPool(['A', 'B']);
+  await pool.refreshAll();
+  try {
+    for (const fixture of [
+      { status: 200, headers: { 'content-type': 'text/html' }, body: '<html>Sign in</html>' },
+      { status: 200, headers: { 'content-type': 'application/json' }, body: '{"error":"not login"}' },
+      { status: 200, headers: {}, body: 'unexpected' },
+      { status: 200, headers: { 'content-type': 'text/event-stream' }, body: ': keepalive\n\ndata: not-json\n\n' },
+    ]) {
+      accountsDef.B.rawResponse = fixture;
+      const runner = new Runner({ pool });
+      mock.hits.ask.length = 0;
+      let error;
+      try { await runner.ask({ text: 'hello' }); } catch (e) { error = e; }
+      await runner.settle();
+      eq(error.code, 'invalid-stream-response'); eq(mock.hits.ask.length, 1);
+      ok(!error.message.includes('<html>')); eq(runner.history, []);
+    }
+  } finally { delete accountsDef.B.rawResponse; }
+});
+
+await test('send: JSON validation errors stay available for 422 self-heal; generic HTML errors are sanitized', async () => {
+  const { store, ids } = mkPool(['A']);
+  const jar = store.jar(ids.A);
+  try {
+    const json = '{"detail":[{"loc":["body","ai_chat_model"],"msg":"invalid model"}]}';
+    for (const fixture of [
+      { status: 422, headers: { 'content-type': 'application/json' }, body: json },
+      { status: 502, headers: { 'content-type': 'text/html' }, body: '<html>secret upstream page, credits exhausted</html>' },
+      { status: 500, headers: { 'content-type': 'text/plain' }, body: 'x'.repeat(100000) },
+    ]) {
+      accountsDef.A.rawResponse = fixture;
+      let error;
+      try { await askStream(jar, { userInput: 'hello' }).promise; } catch (e) { error = e; }
+      eq(error.statusCode, fixture.status);
+      if (fixture.status === 422) eq(error.responseBody, json);
+      if (fixture.status === 502) { eq(error.responseBody, ''); ok(!error.creditExhausted); ok(!error.message.includes('secret')); }
+      if (fixture.status === 500) { eq(error.responseBody.length, 16384); ok(error.message.length < 4100); }
+    }
+  } finally { delete accountsDef.A.rawResponse; }
 });
 
 await test('SEAMLESS HANDOFF: credits die mid-answer -> next live account continues in same project', async () => {

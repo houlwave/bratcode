@@ -116,6 +116,13 @@ under the hood this decrypts each account's `Cookies` database the same way the 
 
 Regression tests cover WAL snapshots, v24 decryption, browser selection, isolated verification, failed/cancelled sign-in, and a batch of **148 synthetic profiles**. They do not prove that any particular real session is still valid. Real macOS Keychain prompts and interactive Genspark sign-in must be checked on the user's Mac.
 
+### message / Cloudflare troubleshooting
+
+- Message responses must be SSE (`text/event-stream`). HTML/JSON pages returned with HTTP 200 and empty/invalid SSE streams now fail explicitly instead of producing a blank successful track.
+- Cloudflare verification is detected by `cf-mitigated: challenge` or challenge HTML markers. The terminal shows a short actionable error, never the challenge HTML/scripts/tokens. A blocked send does not mark the account expired or exhaust its credits, and does not replay the prompt across other accounts.
+- If a send is blocked, open `/accounts`, press `a` to sign in in the browser window, then retry the message manually. If verification still blocks Node's HTTP connection, retry later. Browser cookies and a reCAPTCHA token do not guarantee that Cloudflare will accept a separate Node connection; this change does not bypass Cloudflare or automatically resend messages.
+- Regression tests use local mock responses for HTTP 403/503 challenges, HTTP 200 challenge pages, unexpected response formats, empty streams, bounded error bodies, and preserved JSON validation errors. Live message delivery through Cloudflare still needs verification on the user's machine.
+
 ## what it does
 
 one prompt = **one continuous request**. the model gets a private link to a small server on your mac and drives it with plain `GET` requests: read and edit files, run commands, look at pages, control macOS, use telegram. you watch every step appear under your track.

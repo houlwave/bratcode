@@ -190,6 +190,10 @@ export class Runner extends EventEmitter {
           if (bad.length) { dropFields.push(...bad); dev('info', `422: dropping fields ${bad.join(', ')}`); continue; }
         }
 
+        // A challenge is not an expired session or a credit problem. Do not replay
+        // the prompt across the pool (or retry an unexpected successful response).
+        if (err.code === 'cloudflare-challenge' || err.code === 'invalid-stream-response') throw err;
+
         // network / server error -> rotate to the next account
         dev('warn', `"${acc.name}": ${String(err.message).slice(0, 160)}`);
         exhausted.add(acc.id);
