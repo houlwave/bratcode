@@ -79,6 +79,8 @@ export class Runner extends EventEmitter {
     const wantModel = resolveModelId(model || settings.model);
     const run = { aborted: false, abort: null, projectId: null, askId: null, accId: '', extra: [], t0: Date.now() };
     this.cur = run;
+    // the model needs the PUBLIC url of the sandbox: wait for the invisible tunnel (returns at once if it is up / off)
+    if (this.sandbox && typeof this.sandbox.ready === 'function') { try { await this.sandbox.ready(); } catch { /* local url is the fallback */ } }
     const emit = (ev, d) => this.emit(ev, d);
     const dev = (l, t) => pool.dev(l, t);
     let acc = null;

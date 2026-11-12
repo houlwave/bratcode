@@ -6,11 +6,11 @@
 
 **every session is an album.**
 
-black terminal · brat green `#8ACE00` · demure pink `#F3B6D6` · zero dependencies
+black terminal · brat green `#8ACE00` · demure pink `#F3B6D6` · a full desktop agent
 
 [![license](https://img.shields.io/badge/license-MIT-000000?style=flat-square&labelColor=8ACE00)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-000000?style=flat-square&labelColor=8ACE00)](https://nodejs.org)
-[![status](https://img.shields.io/badge/status-design%20preview-000000?style=flat-square&labelColor=8ACE00)](#status)
+[![status](https://img.shields.io/badge/status-v1.0-000000?style=flat-square&labelColor=8ACE00)](#status)
 
 </div>
 
@@ -28,7 +28,7 @@ then run:
 bratcode
 ```
 
-needs only **node 18+**. no `npm install`, no dependencies. the installer puts the code in `~/.bratcode` and links `bratcode` into `~/.local/bin` (and adds it to your `PATH` if needed).
+needs **node 18+**. the installer installs the few dependencies quietly, puts the code in `~/.bratcode` and links `bratcode` into `~/.local/bin` (and adds it to your `PATH` if needed).
 
 update: run the same command again. uninstall:
 
@@ -77,39 +77,58 @@ it stays simple on purpose: one input, one line, two chips at the bottom. no men
 | `ctrl+p` or `/` | command palette |
 | `up` / `down` | message history |
 | `pgup` / `pgdn` | scroll |
-| `esc` | stop the reply |
+| `esc` | stop the agent |
 | `ctrl+c` | clear input, press twice to quit |
 | `ctrl+n` | new session |
 
-slash commands: `/new` `/flip` `/demo` `/help` `/clear` `/quit`
+slash commands: `/new` `/flip` `/tg` `/accounts` `/balance` `/model` `/undo` `/stop` `/demo` `/help` `/clear` `/quit`
 
 ## options
 
 ```bash
 bratcode --no-anim        # no animations
+bratcode --demo           # design preview, nothing is connected
 bratcode --version
 bratcode --help
 ```
 
+env: `BRATCODE_COLORS=256`, `BRATCODE_NO_TUNNEL=1` (local sandbox only), `BRATCODE_DATA=<dir>` (state, default `~/.bratcode-data`).
+
 works in any modern terminal. if colors look off (macOS Terminal.app has no truecolor) it falls back to 256 colors automatically; force it with `BRATCODE_COLORS=256`. for the best result use iTerm2, Ghostty, WezTerm, kitty or Warp. the layout adapts: below 80 columns the cover hides and only the input stays.
+
+## what it does
+
+one prompt = **one continuous request**. the model gets a private link to a small server on your mac and drives it with plain `GET` requests: read and edit files, run commands, look at pages, control macOS, use telegram. you watch every step appear under your track.
+
+- **type while it works.** text sent during a run does not start a new request: it lands in the run's inbox and the agent reads it with its next step (`+ your text` in the log). no new limits are spent.
+- **your computer is the sandbox.** files anywhere on disk, `exec`, background services, browser and vision tools, `osascript` for Calendar / Notes / Reminders / Finder / Music, screenshots, clipboard. every file change is backed up, `/undo` reverts it.
+- **your telegram.** `/tg` shows a QR code in the terminal (half blocks), supports 2fa. then: "find the family chat, read the weekend plans, text mom that we are coming".
+- **account pool.** accounts live in `~/.bratcode-data`. the best usable account is picked automatically; when credits run out mid-answer the next one continues in the same project, seamlessly. add accounts with `/accounts` (sign in in a window, or import read-only from Chrome / Brave / Edge).
+- **live balance.** refreshed the moment you start typing a prompt, and again right after every request. the bottom line always shows it.
+- **side a / side b.** `A brat` runs sensitive actions (like sending a telegram message) immediately. `B demure` plans first and asks you with a card (`enter` allow, `esc` deny).
+
+the bottom line: `~/dir:branch · tunnel · tg · 12,340 cr`.
 
 ## status
 
-this is a **design preview**. the interface is finished, the agent is not connected: sending a message shows a stub reply so you can feel the whole flow. real functionality (models, files, tools) comes next.
+v1.0. the tui, the sandbox, telegram and the pool are connected and covered by tests (`npm test`, mock genspark + fake telegram, no network needed). the https tunnel is a cloudflared quick tunnel that the installer downloads for you.
 
 ## how it is built
 
-zero dependencies, plain ES modules:
+plain ES modules, a few runtime deps (`playwright-core`, `telegram`, `qrcode`):
 
 ```
-bin/bratcode.js   entry
-src/app.js        screens, input, flip, tracks, player line, stub reply
-src/term.js       cell buffer + diff renderer, truecolor / 256 fallback
-src/cover.js      pixel font + gaussian blur drawn with half-block cells
-src/keys.js       key parser (csi, alt, ctrl, bracketed paste)
-src/text.js       text input buffer + wrapping
-src/theme.js      colors and the two sides
-scripts/          headless renderer that makes the screenshots above
+bin/bratcode.js     entry (--demo = no brain)
+src/app.js          screens, input, flip, tracks, live run, status line
+src/brain.js        wires pool + runner + sandbox + telegram + captcha
+src/overlays.js     /tg qr, /accounts, /model, approval card
+src/sandbox/        the mac as a GET agent: server, files, edit, code, exec, browser, macos, undo, inbox, tunnel
+src/telegram/       personal telegram (gramjs): qr login, tg_* agent commands
+src/pool/           accounts, live balance, ai_chat sse runner, handoff
+src/term.js         cell buffer + diff renderer, truecolor / 256 fallback
+src/cover.js        pixel font + gaussian blur drawn with half-block cells
+tests/              node tests/run-all.js (pool, sandbox, telegram, tui)
+scripts/            headless renderer that makes the screenshots above
 ```
 
 the cover is a tiny pixel font blurred in software, then packed two pixels per terminal cell with `▀`, so the blur is smooth instead of blocky. the flip is the same picture squeezed horizontally by `|cos(πt)|`.

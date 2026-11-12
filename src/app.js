@@ -6,8 +6,9 @@ import { C, MODES } from './theme.js';
 import { Cover } from './cover.js';
 import { parseKeys } from './keys.js';
 import { TextBuffer, wrapText } from './text.js';
+import { TgOverlay, AccountsOverlay, ModelOverlay, ConfirmCard, fmtCredits } from './overlays.js';
 
-export const VERSION = '0.1.0';
+export const VERSION = '1.0.0';
 const MODEL = 'brat-1';
 
 const VERBS = [
@@ -52,6 +53,12 @@ function gitBranch(dir) {
 const COMMANDS = [
   { id: 'new', title: 'new session', hint: 'ctrl+n' },
   { id: 'mode', title: 'flip the record', hint: 'tab' },
+  { id: 'tg', title: 'telegram: link your account', hint: '', live: true },
+  { id: 'accounts', title: 'accounts and balance', hint: '', live: true },
+  { id: 'balance', title: 'refresh balance', hint: '', live: true },
+  { id: 'model', title: 'choose model', hint: '', live: true },
+  { id: 'undo', title: 'undo the last file change', hint: '', live: true },
+  { id: 'stop', title: 'stop the agent', hint: 'esc', live: true },
   { id: 'demo', title: 'show demo session', hint: '' },
   { id: 'keys', title: 'keyboard shortcuts', hint: '' },
   { id: 'exit', title: 'exit', hint: 'ctrl+d' },
@@ -88,11 +95,64 @@ export class App {
     this.lastKey = -1e9;
     this.timer = null;
     this.onQuit = o.onQuit || (() => {});
+
+    // live brain (absent in --demo: the stub reply is used)
+    this.brain = o.brain || null;
+    this.overlay = null;
+    this.cards = [];
+    this.liveBot = null;
+    this.bal = null;
+    this.tg = { linked: false };
+    this.tun = '';
+    if (this.brain) this.attach();
   }
 
   get mode() { return MODES[this.modeKey]; }
   get busy() { return this.messages.some((m) => m.role === 'bot' && !m.done); }
-  get trackNo() { return this.messages.filter((m) => m.role === 'user').length + 1; }
+  get trackNo() { return this.messages.filter((m) => m.role === 'user' && !m.inbox).length + 1; }
+  cmds() { return COMMANDS.filter((c) => !c.live || this.brain); }
+
+  // ---------------------------------------------------------------- brain wiring
+  attach() {
+    const b = this.brain;
+    this.bal = b.pool.summary();
+    b.pool.on('balance', (s) => { this.bal = s; });
+    this.tun = b.sandbox.tunnel.status;
+    b.sandbox.tunnel.on('status', (s) => { this.tun = s.status; });
+    this.refreshTg();
+    // streamed answer text of the live run
+    b.runner.on('chunk', (c) => {
+      const bot = this.liveBot;
+      if (!bot || c.kind !== 'text') return;
+      if (c.replace) bot.text = c.text || '';
+      else bot.text += c.delta || '';
+    });
+    // live steps = what the agent really does on this computer (sandbox timeline)
+    b.sandbox.events.bus.on('msg', (m) => {
+      const bot = this.liveBot;
+      if (!bot || m.ev !== 'item') return;
+      const it = m.item;
+      if (it.kind === 'user' || it.kind === 'say') return;
+      let st = bot.items.get(it.id);
+      if (!st) { st = {}; bot.items.set(it.id, st); bot.steps.push(st); }
+      st.label = String(it.title || it.kind).replace(/\s+/g, ' ');
+      st.status = it.status === 'running' ? 'running' : it.status === 'ok' ? 'ok' : 'err';
+      st.detail = it.ms != null ? (it.ms >= 1000 ? `${(it.ms / 1000).toFixed(1)}s` : `${it.ms}ms`) : '';
+    });
+    // side a runs sensitive actions at once, side b asks first
+    b.onConfirm = (cmd, params) => (this.modeKey === 'brat' ? true : new Promise((resolve) => {
+      this.cards.push(new ConfirmCard({ cmd, params, resolve }));
+    }));
+  }
+
+  refreshTg() {
+    try { this.tg = this.brain.tg.service.cached(); } catch { this.tg = { linked: false }; }
+  }
+
+  openOverlay(Cls) {
+    if (!this.brain) return this.say('demo mode: nothing is connected');
+    this.overlay = new Cls(this);
+  }
 
   // ---------------------------------------------------------------- lifecycle
   start() {
@@ -128,8 +188,10 @@ export class App {
     this.restore();
     const g = this.screen.truecolor ? '\x1b[38;2;138;206;0m' : '\x1b[38;5;112m';
     this.out.write(`\n  ${g}\x1b[1mbye.\x1b[0m stay ${g}\x1b[1mbrat\x1b[0m.\n\n`);
-    this.onQuit();
-    process.exit(0);
+    for (const c of this.cards) c.answer(false);
+    // let the brain stop the tunnel / browser, but never hang the exit
+    Promise.race([Promise.resolve().then(() => this.onQuit()), new Promise((r) => setTimeout(r, 1500))])
+      .catch(() => {}).finally(() => process.exit(0));
   }
 
   frame() {
@@ -141,9 +203,24 @@ export class App {
   // ---------------------------------------------------------------- input
   say(text, ms = 2200) { this.toast = { text, until: this.clock() + ms }; }
 
+  // balance trigger #1: the moment the text of the prompt changes (the user started typing)
   key(k) {
+    const before = this.input.text;
+    this._key(k);
+    if (this.brain && !this.palette && !this.overlay && this.input.text !== before && this.input.text) this.brain.onTyping();
+  }
+
+  _key(k) {
     const now = this.clock();
     this.lastKey = now;
+    if (this.cards.length) {
+      if (this.cards[0].key(k) === 'close') this.cards.shift();
+      return;
+    }
+    if (this.overlay) {
+      if (this.overlay.key(k) === 'close') this.overlay = null;
+      return;
+    }
     if (this.palette) return this.paletteKey(k);
     const inp = this.input;
 
@@ -232,7 +309,7 @@ export class App {
 
   paletteItems() {
     const q = this.palette.query.trim().toLowerCase();
-    return COMMANDS.filter((c) => !q || c.title.includes(q) || c.id.includes(q));
+    return this.cmds().filter((c) => !q || c.title.includes(q) || c.id.includes(q));
   }
 
   paletteKey(k) {
@@ -268,6 +345,24 @@ export class App {
         this.placeholder = pick(PLACEHOLDERS);
         break;
       case 'mode': this.flip(); break;
+      case 'tg': this.openOverlay(TgOverlay); break;
+      case 'accounts':
+        this.openOverlay(AccountsOverlay);
+        if (this.brain) this.brain.pool.refreshAll().catch(() => {});
+        break;
+      case 'model': this.openOverlay(ModelOverlay); break;
+      case 'balance':
+        if (!this.brain) { this.say('demo mode: nothing is connected'); break; }
+        this.say('checking balances...');
+        this.brain.pool.refreshAll().then(() => { const b = this.brain.pool.summary(); this.say(`${fmtCredits(b.total)} credits on ${b.usable}/${b.count} accounts`); }).catch(() => this.say('balance check failed'));
+        break;
+      case 'undo':
+        if (!this.brain) { this.say('demo mode: nothing is connected'); break; }
+        this.brain.sandbox.backups.undo(1)
+          .then((r) => this.say(r.length ? `reverted: ${r[0].path}` : 'nothing to undo'))
+          .catch((e) => this.say(`undo failed: ${String((e && e.message) || e).slice(0, 60)}`));
+        break;
+      case 'stop': if (this.busy) this.stopBot(); break;
       case 'demo': this.demo(); break;
       case 'keys': this.help(); break;
       case 'exit': this.quit(); break;
@@ -282,11 +377,12 @@ export class App {
     if (text.startsWith('/')) {
       const id = text.slice(1).split(/\s+/)[0].toLowerCase();
       const alias = { help: 'keys', quit: 'exit', q: 'exit', clear: 'new', flip: 'mode' }[id] || id;
-      if (COMMANDS.some((c) => c.id === alias)) {
+      if (this.cmds().some((c) => c.id === alias)) {
         this.input.clear();
         return this.run(alias);
       }
     }
+    if (this.brain) return this.submitLive(text);
     if (this.busy) return this.say('one sec, being iconic');
     this.history.push(text);
     this.histIdx = -1;
@@ -294,6 +390,42 @@ export class App {
     this.view = 'chat';
     this.scroll = 0;
     this.send(text);
+  }
+
+  // ---------------------------------------------------------------- live run
+  // idle: one prompt = one continuous ai_chat request that drives the computer.
+  // busy: the text goes to the inbox of THAT run (no new request, no new limits).
+  submitLive(text) {
+    const runner = this.brain.runner;
+    this.history.push(text);
+    this.histIdx = -1;
+    this.input.clear();
+    this.view = 'chat';
+    this.scroll = 0;
+    if (runner.busy) {
+      runner.send(text);
+      this.messages.push({ role: 'user', text, mode: this.modeKey, inbox: true });
+      return;
+    }
+    if (this.tun === 'missing') this.say('no cloudflared: the agent cannot reach this mac. rerun the installer', 5000);
+    const bot = { role: 'bot', live: true, mode: this.modeKey, steps: [], items: new Map(), text: '', t0: this.clock(), thinkMs: 0, cps: 1e6, verb: pick(VERBS), done: false };
+    const user = { role: 'user', text, mode: this.modeKey, bot };
+    this.messages.push(user, bot);
+    this.liveBot = bot;
+    const task = this.modeKey === 'demure' ? `[side b, demure: state a short plan first, then do it carefully, one step at a time]\n${text}` : text;
+    const r = runner.send(task);
+    r.promise.then((res) => this.endLive(bot, res), (e) => this.endLive(bot, null, e));
+  }
+
+  endLive(bot, res, e) {
+    if (bot.done) return;
+    bot.done = true;
+    bot.dur = this.clock() - bot.t0;
+    for (const st of bot.steps) if (st.status === 'running') st.status = 'ok';
+    if (e) bot.error = String((e && e.message) || e).replace(/\s+/g, ' ');
+    else if (res && res.aborted) { bot.stopped = true; bot.cut = bot.text.length; }
+    else if (res && res.content) bot.text = res.content;
+    if (this.liveBot === bot) this.liveBot = null;
   }
 
   // the stub: no brain yet, only a very pretty reply
@@ -384,7 +516,14 @@ export class App {
   stopBot() {
     const now = this.clock();
     for (const m of this.messages) {
-      if (m.role === 'bot' && !m.done) {
+      if (m.role === 'bot' && !m.done && m.live) {
+        try { this.brain.runner.stop(); } catch { /* ignore */ }
+        m.cut = m.text.length;
+        m.done = true;
+        m.stopped = true;
+        m.dur = now - m.t0;
+        if (this.liveBot === m) this.liveBot = null;
+      } else if (m.role === 'bot' && !m.done) {
         m.cut = Math.max(0, this.botShown(m, now));
         m.done = true;
         m.stopped = true;
@@ -394,14 +533,16 @@ export class App {
   }
 
   botShown(m, now) {
+    if (m.live) return m.done ? m.text.length : -1;
     const el = now - m.t0;
     if (el < m.thinkMs) return -1;
     return Math.floor(((el - m.thinkMs - (m.steps.length ? 350 : 0)) / 1000) * m.cps);
   }
 
   tick(now) {
+    while (this.cards.length && this.cards[0].done) this.cards.shift();
     for (const m of this.messages) {
-      if (m.role !== 'bot' || m.done) continue;
+      if (m.role !== 'bot' || m.done || m.live) continue;
       if (this.botShown(m, now) >= m.text.length) {
         m.done = true;
         m.dur = m.thinkMs + (m.steps.length ? 350 : 0) + (m.text.length / m.cps) * 1000;
@@ -420,6 +561,29 @@ export class App {
     else this.drawChat(now);
     this.drawToast(now);
     if (this.palette) { this.scrim(0.6); this.drawPalette(now); }
+    if (this.overlay) { this.scrim(0.6); this.overlay.draw(s, now, this.mode.color); }
+    if (this.cards.length) { this.scrim(0.6); this.cards[0].draw(s, now, this.mode.color); }
+  }
+
+  // bottom status: dir:branch . tunnel . tg . balance
+  drawStatus(x, y, maxX) {
+    const s = this.screen;
+    let cx = s.text(x, y, this.dir + (this.branch ? `:${this.branch}` : ''), C.faint, -1, 0, maxX);
+    if (!this.brain) return;
+    const t = this.tun;
+    const parts = [
+      [t === 'up' ? 'tunnel' : t === 'starting' ? 'tunnel...' : t === 'off' ? 'local' : t === 'missing' ? 'no tunnel' : 'tunnel down', t === 'up' ? C.green : (t === 'starting' || t === 'off') ? C.dim : C.hot],
+      [this.tg.linked ? 'tg' : 'tg off', this.tg.linked ? C.green : C.faint],
+    ];
+    const b = this.bal;
+    if (b) {
+      const name = b.active && this.busy ? `${b.active.name} ` : '';
+      parts.push([b.count ? `${name}${fmtCredits(b.total)} cr${b.refreshing ? ' ~' : ''}` : 'no accounts', !b.count || !b.usable ? C.hot : C.dim]);
+    }
+    for (const [txt, col] of parts) {
+      cx = s.text(cx, y, '  \u00b7  ', C.faint, -1, 0, maxX);
+      cx = s.text(cx, y, txt, col, -1, 0, maxX);
+    }
   }
 
   scrim(a) {
@@ -471,7 +635,7 @@ export class App {
       return;
     }
     const shown = this.botShown(bot, now);
-    if (shown < 0) {
+    if (shown < 0) { // thinking, or a live run (indeterminate: the segment keeps sweeping)
       const len = 8;
       const pos = Math.round(((Math.sin((now / 1000) * 3.4 - 1.57) + 1) / 2) * (w - len));
       for (let i = 0; i < len; i++) s.put(x + pos + i, y, '\u2501', mix(C.faint, color, Math.sin((Math.PI * (i + 0.5)) / len)));
@@ -561,7 +725,7 @@ export class App {
     this.drawChips(rx, iy + n + 2, now);
     if (wide) this.drawHints(rx + rw, ry + rows - 1);
     else this.drawHints(rx + rw, iy + n + 4);
-    s.text(2, h - 1, this.dir + (this.branch ? `:${this.branch}` : ''), C.faint, -1, 0, w - 4);
+    this.drawStatus(2, h - 1, w - 2);
   }
 
   eq(x, y, now, color, n = 5) {
@@ -579,7 +743,16 @@ export class App {
     const blank = () => lines.push(() => {});
     let n = 0;
     for (const m of this.messages) {
-      if (m.role === 'user') {
+      if (m.role === 'user' && m.inbox) {
+        // typed while the agent works: delivered to the same run, not a new track
+        wrapText(m.text, cw - 12).forEach((r, i) => {
+          lines.push((y) => {
+            s.text(mx + 2, y, i === 0 ? '+' : ' ', MODES[m.mode].color, -1, BOLD);
+            s.text(mx + 4, y, r, C.text, -1, 0, mx + cw - 8);
+          });
+        });
+        blank();
+      } else if (m.role === 'user') {
         n++;
         const no = n;
         const color = MODES[m.mode].color;
@@ -598,7 +771,35 @@ export class App {
       } else if (m.role === 'bot') {
         const color = MODES[m.mode].color;
         const shown = m.done && !m.stopped ? m.text.length : m.stopped ? m.cut : this.botShown(m, now);
-        if (!m.done && shown < 0) {
+        if (m.live) {
+          // a real run: steps appear as the agent touches this computer, the text streams under them
+          const steps = m.steps.slice(-12);
+          if (m.steps.length > steps.length) lines.push((y) => s.text(mx + 4, y, `... ${m.steps.length - steps.length} earlier steps`, C.faint));
+          for (const st of steps) {
+            lines.push((y) => {
+              const run = st.status === 'running';
+              const bad = st.status === 'err';
+              const mark = run ? EQ[1 + Math.floor(now / 120) % 7] : bad ? '\u2717' : '\u2713';
+              let x = s.text(mx + 4, y, mark, bad ? C.hot : color, -1, BOLD);
+              x = s.text(x + 1, y, st.label, run ? C.fg : C.text, -1, 0, mx + cw - 12);
+              if (st.detail) s.text(Math.min(x + 2, mx + cw - st.detail.length), y, st.detail, C.dim);
+            });
+          }
+          if (!m.done) {
+            lines.push((y) => {
+              const x = this.eq(mx + 4, y, now, color);
+              const x2 = s.text(x + 2, y, m.verb, C.text);
+              s.text(x2 + 2, y, `${((now - m.t0) / 1000).toFixed(1)}s`, C.dim);
+            });
+          }
+          if (m.steps.length || !m.done) blank();
+          wrapText(m.text, cw - 8).forEach((r) => {
+            if (r) lines.push((y) => s.text(mx + 4, y, r, C.text));
+          });
+          if (m.error) wrapText(m.error, cw - 8).forEach((r) => lines.push((y) => s.text(mx + 4, y, r, C.hot)));
+          if (m.stopped) lines.push((y) => s.text(mx + 4, y, 'stopped.', C.dim, -1, ITALIC));
+          blank();
+        } else if (!m.done && shown < 0) {
           lines.push((y) => {
             const x = this.eq(mx + 4, y, now, color);
             const x2 = s.text(x + 2, y, m.verb, C.text);
@@ -682,7 +883,7 @@ export class App {
 
     this.drawInput(mx, inputY, cw, now, color);
     this.drawBar(mx, barY, cw, now, color);
-    s.text(mx, h - 1, this.dir + (this.branch ? `:${this.branch}` : ''), C.faint, -1, 0, mx + cw - 30);
+    this.drawStatus(mx, h - 1, mx + cw - 30);
     this.drawHints(mx + cw, h - 1);
   }
 
