@@ -1,22 +1,41 @@
 {
   "name": "bratcode",
-  "version": "0.1.0",
-  "description": "a coding agent cli that is so brat. (design preview)",
+  "version": "1.0.0",
+  "description": "a full desktop & coding agent cli that is so brat.",
   "type": "module",
   "bin": {
     "bratcode": "bin/bratcode.js"
+  },
+  "scripts": {
+    "start": "node bin/bratcode.js",
+    "test": "node tests/run-all.js"
   },
   "files": [
     "bin",
     "src",
     "install.sh",
+    "PLAN.md",
     "README.md",
     "LICENSE"
   ],
+  "dependencies": {
+    "playwright-core": "^1.50.0",
+    "qrcode": "^1.5.4",
+    "telegram": "^2.26.22"
+  },
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["cli", "tui", "brat", "ai", "coding-agent", "terminal"],
+  "keywords": [
+    "cli",
+    "tui",
+    "brat",
+    "ai",
+    "coding-agent",
+    "desktop-agent",
+    "telegram",
+    "terminal"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
