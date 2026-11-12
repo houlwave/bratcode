@@ -23,11 +23,11 @@ export function createBackups({ dir, session } = {}) {
   };
 
   // snapshot `abs` (file, dir or missing path) BEFORE the agent changes it
-  async function save(abs, op = 'write') {
+  async function save(abs, op = 'write', grp = null) {
     const id = ++seq;
     let st = null;
     try { st = await fsp.lstat(abs); } catch { st = null; }
-    const entry = { id, t: Date.now(), op, path: abs, existed: !!st, kind: st ? (st.isDirectory() ? 'dir' : st.isSymbolicLink() ? 'link' : 'file') : null };
+    const entry = { id, grp: grp || id, t: Date.now(), op, path: abs, existed: !!st, kind: st ? (st.isDirectory() ? 'dir' : st.isSymbolicLink() ? 'link' : 'file') : null };
     if (st) {
       const dest = path.join(blobs, String(id));
       try {
@@ -52,12 +52,14 @@ export function createBackups({ dir, session } = {}) {
 
   const list = (n = 20) => journal.slice(-n).reverse();
 
-  // revert last n entries (newest first). Entries with `skipped` cannot be restored.
+  // revert last n operations (newest first). One operation = all snapshots sharing a group (mv, patch).
   async function undo(n = 1) {
     const out = [];
-    for (let i = 0; i < n; i++) {
+    let units = 0, curGrp = null;
+    while (journal.length) {
+      const top = journal[journal.length - 1];
+      if (top.grp !== curGrp) { if (units >= n) break; units++; curGrp = top.grp; }
       const e = journal.pop();
-      if (!e) break;
       try {
         const blob = path.join(blobs, String(e.id));
         if (!e.existed) {

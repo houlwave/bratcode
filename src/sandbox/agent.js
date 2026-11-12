@@ -125,6 +125,9 @@ export function createAgent({ ROOT, PORT, safe, relOf, token, serveFile, proxy, 
     return []
   }
 
+  // patch paths: with &root=/folder they are relative to it; otherwise absolute stays absolute, relative -> project folder
+  const patchPath = (rootDir, p0) => (rootDir ? safe(path.join(safe(rootDir), String(p0).replace(/^\/+/, ''))) : safe(p0))
+
   // ---------- batch: список команд ----------
   const BATCH_MAX = 20
   function batchItems(p) {
@@ -366,7 +369,7 @@ export function createAgent({ ROOT, PORT, safe, relOf, token, serveFile, proxy, 
           const getText = async (abs) => { if (state.has(abs)) return state.get(abs); try { return await fsp.readFile(abs, 'utf8') } catch (e) { if (e.code === 'ENOENT') return null; throw e } }
           for (const f of files) {
             if (!f.path) throw new EditError('a hunk has no file name (missing "--- a/file" / "+++ b/file" lines)', 400)
-            const abs = safe(rootDir + '/' + f.path.replace(/^\/+/, '')); const label = relOf(abs)
+            const abs = patchPath(rootDir, f.path); const label = relOf(abs)
             if (f.op === 'add') {
               const cur = await getText(abs)
               if (cur !== null && cur !== '' && p.force !== '1') throw new EditError(`${label}: the patch creates this file but it already exists (add &force=1 to overwrite, or use "Update File")`, 409)
@@ -378,7 +381,7 @@ export function createAgent({ ROOT, PORT, safe, relOf, token, serveFile, proxy, 
               const cur = await getText(abs); if (cur === null) throw new EditError(`${label}: file not found (the patch updates it). Check the path with /glob?pattern=${path.basename(label)}${rootDir ? '' : ' or pass &root=/folder'}`, 404)
               if (!state.has(abs)) checkSha(p, cur, label)
               const r = applyHunks(cur, f.hunks, label)
-              const dest = f.moveTo ? safe(rootDir + '/' + f.moveTo.replace(/^\/+/, '')) : abs
+              const dest = f.moveTo ? patchPath(rootDir, f.moveTo) : abs
               if (dest !== abs) { state.set(abs, null); state.set(dest, r.out); order.push(abs, dest) } else { state.set(abs, r.out); order.push(abs) }
               rep.push(`${label}${dest !== abs ? ' -> ' + relOf(dest) : ''}: ${r.report.join('; ')}`)
             }
@@ -386,7 +389,7 @@ export function createAgent({ ROOT, PORT, safe, relOf, token, serveFile, proxy, 
           const uniq = [...new Set(order)]
           if (p.dry === '1' || p.dry === 'true') return R(`DRY RUN ok: patch would change ${uniq.length} file(s) (nothing written)\n${rep.map((r) => '  ' + r).join('\n')}`, { ok: true, dry: true, report: rep })
           const done = []; let firstDiff = null, firstPath
-          if (backups) for (const abs of uniq) await backups.save(abs, 'patch')
+          if (backups) { const g = 'patch' + Date.now() + Math.random(); for (const abs of uniq) await backups.save(abs, 'patch', g) }
           for (const abs of uniq) {
             const v = state.get(abs)
             if (v === null) { await fsp.rm(abs, { force: true }); continue }
@@ -467,7 +470,7 @@ export function createAgent({ ROOT, PORT, safe, relOf, token, serveFile, proxy, 
         }
         case 'mkdir': { const abs = safe(p.path); await fsp.mkdir(abs, { recursive: true }); return R(`OK created ${relOf(abs)}/`, { ok: true }) }
         case 'rm': { const abs = safe(p.path); if (abs === ROOT) return fail('refusing to delete root'); if (backups) await backups.save(abs, 'rm'); await fsp.rm(abs, { recursive: true, force: true }); return R(`OK deleted ${relOf(abs)}`, { ok: true }) }
-        case 'mv': { const a = safe(p.from), b = safe(p.to); if (backups) { await backups.save(a, 'mv'); await backups.save(b, 'mv') } await fsp.mkdir(path.dirname(b), { recursive: true }); await fsp.rename(a, b); return R(`OK ${relOf(a)} -> ${relOf(b)}`, { ok: true }) }
+        case 'mv': { const a = safe(p.from), b = safe(p.to); if (backups) { const g = 'mv' + Date.now() + Math.random(); await backups.save(b, 'mv', g); await backups.save(a, 'mv', g) } await fsp.mkdir(path.dirname(b), { recursive: true }); await fsp.rename(a, b); return R(`OK ${relOf(a)} -> ${relOf(b)}`, { ok: true }) }
         case 'cp': { const a = safe(p.from), b = safe(p.to); if (backups) await backups.save(b, 'cp'); await fsp.mkdir(path.dirname(b), { recursive: true }); await fsp.cp(a, b, { recursive: true }); return R(`OK copied to ${relOf(b)}`, { ok: true }) }
         case 'exec': {
           const command = val(p, 'cmd'); if (!command) return fail('missing "cmd" (or "cmd_b64")')
