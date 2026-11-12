@@ -193,6 +193,17 @@ await test('/accounts: list with balances, pin with enter, remove needs d twice'
   eq(store.list().length, 2);
   app.key({ name: 'escape' });
   eq(app.overlay, null);
+
+  // Long diagnostics remain readable; repeated 'a' must not orphan an active login.
+  app.run('accounts');
+  const overlay = app.overlay;
+  overlay.msg = 'imported 0/148, 148 failed: Genspark blocked the API check (HTTP 403 / browser challenge); cookies were not proven invalid. Use a sign-in window or retry later.';
+  const diagnosticText = screenText(app);
+  has(diagnosticText, 'imported 0/148'); has(diagnosticText, 'not proven invalid'); has(diagnosticText, 'retry later.');
+  overlay.working = true; overlay.ctl = new AbortController();
+  const ctl = overlay.ctl;
+  app.key({ name: 'char', text: 'a' }); eq(overlay.ctl, ctl);
+  app.key({ name: 'escape' }); ok(ctl.signal.aborted); eq(app.overlay, null);
 });
 
 await test('/model overlay lists the catalog and escape closes it', () => {

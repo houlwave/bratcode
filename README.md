@@ -28,7 +28,7 @@ then run:
 bratcode
 ```
 
-needs **node 18+**. the installer installs the few dependencies quietly, puts the code in `~/.bratcode` and links `bratcode` into `~/.local/bin` (and adds it to your `PATH` if needed).
+needs **node 18+**. the installer installs the few dependencies quietly, puts the code in `~/.bratcode` and links `bratcode` into `~/.local/bin` (and adds it to your `PATH` if needed). It uses an installed Chrome/Brave/Edge/Chromium, or downloads full Chromium for both visible sign-in windows and headless agent operations. A headless-shell-only installation cannot show a login window; rerun the installer to upgrade it.
 
 update: run the same command again. uninstall:
 
@@ -105,6 +105,16 @@ if you used the `claudehack` desktop app before, its accounts live in `~/Library
 3. press `c` to import every account found there
 
 under the hood this decrypts each account's `Cookies` database the same way the browser-import (`i`) does, except the macOS Keychain item is named after `claudehack`'s app name (`Claude Safe Storage`) instead of a browser. macOS will ask you to allow Keychain access the first time; click "Allow" (or "Always Allow" to skip the prompt on future imports). set `BRATCODE_CLAUDEHACK_KEYCHAIN=<name>` if your copy of claudehack was renamed and uses a different Keychain item. the pinned folder is remembered in `~/.bratcode-data/settings.json`, so `c` re-imports (and refreshes) with one keystroke next time.
+
+### import / sign-in troubleshooting
+
+- Cookie import now uses a read-only SQLite snapshot, including committed `Cookies-wal` data. Copying just `Cookies` could previously read stale sessions. Chromium v24 host hashes are stripped and validated before sending cookie values.
+- `/api/user` supports both top-level and `data`-wrapped user records. If the plain HTTP check cannot verify a session, the importer retries in Chromium, with a separate context per account. Accounts are saved only after a successful user check; expired sessions are not silently imported as working accounts.
+- HTTP 403 / browser challenges, request failures, and expired sessions have distinct messages. `/accounts` wraps diagnostics across multiple lines instead of truncating them to “these cookies are”. If a browser challenge still prevents verification, use `a` to sign in manually or retry later; import does not bypass challenges.
+- Sign-in (`/accounts` → `a`) selects a window-capable executable, focuses the window, verifies the user inside that browser, and cleans temporary profiles even after failed launches or cancellation. `esc` cancels; on Linux a graphical desktop is required. Set `CHROMIUM_PATH` to a full Chrome/Chromium executable if discovery fails (not `chrome-headless-shell`).
+- macOS import needs the system `security` and `sqlite3` commands and permission to read the original app's Safe Storage Keychain item. Cookies encrypted on a different Mac need the original Keychain key, not just a copied profile folder.
+
+Regression tests cover WAL snapshots, v24 decryption, browser selection, isolated verification, failed/cancelled sign-in, and a batch of **148 synthetic profiles**. They do not prove that any particular real session is still valid. Real macOS Keychain prompts and interactive Genspark sign-in must be checked on the user's Mac.
 
 ## what it does
 

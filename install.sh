@@ -57,7 +57,8 @@ say "${D}installing agent runtime...${R}"
 (cd "$DIR" && npm install --omit=dev --no-audit --no-fund --loglevel=error) || die "npm install failed"
 ok "agent runtime ready"
 
-# ensure browser for invisible session / look (uses system Chrome/Brave/Chromium if installed, else downloads lightweight shell)
+# A headless shell cannot open the /accounts sign-in window. Prefer a system browser,
+# otherwise install full Chromium (also supports headless agent operations).
 HAS_CHROME="$(node -e '
 const fs = require("fs");
 const paths = [
@@ -70,10 +71,15 @@ const paths = [
 console.log(paths.find(p => fs.existsSync(p)) ? "1" : "0");
 ')"
 if [ "$HAS_CHROME" = "0" ]; then
-  say "${D}downloading headless chromium...${R}"
-  PLAYWRIGHT_BROWSERS_PATH="$DATA_DIR/browsers" npx --prefix "$DIR" playwright-core install chromium-headless-shell >/dev/null 2>&1 || true
+  say "${D}downloading chromium (sign-in windows + agent browser)...${R}"
+  if PLAYWRIGHT_BROWSERS_PATH="$DATA_DIR/browsers" npx --prefix "$DIR" playwright-core install chromium >/dev/null 2>&1; then
+    ok "browser ready (window + headless)"
+  else
+    say "WARNING: Chromium download failed. Install Google Chrome before using /accounts sign in."
+  fi
+else
+  ok "system browser ready (window + headless)"
 fi
-ok "headless browser ready"
 
 # install cloudflared binary silently into ~/.bratcode-data/bin if missing
 if ! command -v cloudflared >/dev/null 2>&1 && [ ! -x "$DATA_DIR/bin/cloudflared" ]; then

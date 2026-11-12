@@ -54,11 +54,12 @@ export function enrichedPath(basePath = process.env.PATH || '') {
   return parts.join(':');
 }
 
-export function findBrowserExecutable() {
-  if (process.env.CHROMIUM_PATH && fs.existsSync(process.env.CHROMIUM_PATH)) return process.env.CHROMIUM_PATH;
+export function findBrowserExecutable({ headed = false, exists = fs.existsSync, readDir = fs.readdirSync, env = process.env } = {}) {
+  const usable = (file) => (!headed || !/headless[_-]shell/i.test(file)) && exists(file);
+  if (env.CHROMIUM_PATH && usable(env.CHROMIUM_PATH)) return env.CHROMIUM_PATH;
 
   const pwRoots = [
-    process.env.PLAYWRIGHT_BROWSERS_PATH,
+    env.PLAYWRIGHT_BROWSERS_PATH,
     BROWSERS_DIR,
     path.join(HOME, 'Library', 'Caches', 'ms-playwright'),
     path.join(HOME, '.cache', 'ms-playwright'),
@@ -69,12 +70,13 @@ export function findBrowserExecutable() {
 
   for (const root of pwRoots) {
     let dirs = [];
-    try { dirs = fs.readdirSync(root).sort().reverse(); } catch { continue; }
+    try { dirs = readDir(root).sort().reverse(); } catch { continue; }
     for (const d of dirs) {
       const cands = [
         path.join(root, d, 'chrome-headless-shell-mac-arm64', 'chrome-headless-shell'),
         path.join(root, d, 'chrome-headless-shell-mac-x64', 'chrome-headless-shell'),
         path.join(root, d, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
+        path.join(root, d, 'chrome-mac-x64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
         path.join(root, d, 'chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'),
         path.join(root, d, 'chrome-headless-shell-linux64', 'chrome-headless-shell'),
         path.join(root, d, 'chrome-linux64', 'chrome'),
@@ -82,7 +84,7 @@ export function findBrowserExecutable() {
         path.join(root, d, 'chrome-linux', 'chrome'),
       ];
       for (const c of cands) {
-        if (fs.existsSync(c)) return c;
+        if (usable(c)) return c;
       }
     }
   }
@@ -97,7 +99,7 @@ export function findBrowserExecutable() {
     '/usr/bin/google-chrome',
   ];
   for (const s of sys) {
-    if (fs.existsSync(s)) return s;
+    if (usable(s)) return s;
   }
   return undefined;
 }

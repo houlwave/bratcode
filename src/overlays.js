@@ -160,7 +160,7 @@ export class AccountsOverlay {
     if (this.working) return;
     this.working = true;
     this.msg = label;
-    try { this.msg = await fn(); } catch (e) { this.msg = err(e); } finally { this.working = false; this.brain.pool.changed(); }
+    try { this.msg = await fn(); } catch (e) { this.msg = String(e.message || e).replace(/\s+/g, ' '); } finally { this.working = false; this.brain.pool.changed(); }
   }
 
   key(k) {
@@ -183,6 +183,7 @@ export class AccountsOverlay {
       return;
     }
     if (k.name === 'escape' || (k.ctrl && k.name === 'c')) { try { this.ctl?.abort(); } catch { /* ignore */ } return 'close'; }
+    if (this.working) return; // do not replace the active login's AbortController on repeated 'a'
     if (k.name === 'up') { this.sel = Math.max(0, this.sel - 1); this.armDel = ''; return; }
     if (k.name === 'down') { this.sel = Math.min(Math.max(0, rows.length - 1), this.sel + 1); this.armDel = ''; return; }
     if (k.name !== 'char' || k.alt) {
@@ -208,7 +209,7 @@ export class AccountsOverlay {
           const r = await importFromBrowsers(store, { onStatus: (t) => { this.msg = t; } });
           await pool.refreshAll();
           const bad = r.failed[0] ? `, ${r.failed.length} failed: ${r.failed[0].error}` : '';
-          return `imported ${r.added.length} from ${r.scanned} profiles${bad}`.slice(0, 110);
+          return `imported ${r.added.length}/${r.scanned}${bad}`;
         });
       case 'p':
         this.editingPath = true;
@@ -221,7 +222,7 @@ export class AccountsOverlay {
           const r = await importFromClaudehackDir(store, dir, { onStatus: (t) => { this.msg = t; } });
           await pool.refreshAll();
           const bad = r.failed[0] ? `, ${r.failed.length} failed: ${r.failed[0].error}` : '';
-          return `imported ${r.added.length} from ${r.scanned} claudehack accounts${bad}`.slice(0, 120);
+          return `imported ${r.added.length}/${r.scanned}${bad}`;
         });
       }
       case 'r':
@@ -245,7 +246,7 @@ export class AccountsOverlay {
   draw(s, now, color) {
     const rows = this.rows();
     const extra = this.editingPath ? 2 : 0;
-    const p = panel(s, 76, 9 + extra + Math.max(2, Math.min(rows.length, 10)), 'accounts', color);
+    const p = panel(s, 76, 12 + extra + Math.max(2, Math.min(rows.length, 10)), 'accounts', color);
     const bal = this.app.bal;
     if (bal) s.text(p.x + 15, p.y + 1, `${fmtCredits(bal.total)} credits  ${bal.usable}/${bal.count} usable`, C.dim, C.panel, 0, p.x + p.pw - 8);
     let y = p.y + 3;
@@ -286,8 +287,12 @@ export class AccountsOverlay {
       s.text(p.ix + p.iw - right.length, y, right, a.dead ? (on ? C.bg : C.hot) : dim, bg);
       y++;
     }
-    y = p.y + p.ph - 4;
-    if (this.msg) s.text(p.ix, y, this.msg, this.working ? color : C.text, C.panel, 0, p.ix + p.iw);
+    y = p.y + p.ph - 7;
+    if (this.msg) {
+      for (const line of wrapText(this.msg, p.iw).slice(0, 4)) {
+        s.text(p.ix, y++, line, this.working ? color : C.text, C.panel, 0, p.ix + p.iw);
+      }
+    }
     s.text(p.ix, p.y + p.ph - 2, 'a sign in   i import   c claudehack   p set folder   r refresh   d remove   enter pin', C.dim, C.panel, 0, p.ix + p.iw);
   }
 }

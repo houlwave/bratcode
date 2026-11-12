@@ -1,5 +1,5 @@
 // Adding accounts to the pool:
-//   1) loginInWindow()  - opens a REAL (visible) browser window on genspark.ai; as soon as the auth cookie appears the window closes
+//   1) loginInWindow()  - opens a REAL browser window and closes after /api/user confirms sign-in
 //   2) importFromBrowsers() - read-only import of existing Genspark sessions from the user's Chrome/Brave/Edge profiles on this Mac
 //   3) importFromFile() - claudehack export (accounts.json + partitions) or a plain cookies.json
 import fs from 'node:fs';
@@ -7,56 +7,98 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { findBrowserExecutable, HOME, IS_MAC, DEFAULT_CLAUDEHACK_DIR } from '../paths.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { findBrowserExecutable, HOME, IS_MAC } from '../paths.js';
 import * as cfg from './config.js';
-import { fetchUserInfo } from './balance.js';
+import { fetchUserInfo, parseUserInfo } from './balance.js';
 
 // ---------------------------------------------------------------- 1) window login
-export async function loginInWindow(store, { onStatus, timeoutMs = 10 * 60 * 1000, signal } = {}) {
-  const exe = findBrowserExecutable();
-  if (!exe) throw new Error('no Chrome/Brave/Chromium found. Install one (brew install --cask google-chrome) or use /accounts import');
-  const { chromium } = await import('playwright-core');
+export async function loginInWindow(store, { onStatus, timeoutMs = 10 * 60 * 1000, signal, findExecutable = findBrowserExecutable, browserType } = {}) {
+  if (signal?.aborted) throw new Error('cancelled');
+  const exe = findExecutable({ headed: true });
+  if (!exe) throw new Error('no window-capable browser. Install Google Chrome or rerun the bratcode installer (headless-shell cannot show a login window).');
+  if (!IS_MAC && process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY && !browserType) {
+    throw new Error('no graphical display: run bratcode in a desktop session to sign in');
+  }
+  const chromium = browserType || (await import('playwright-core')).chromium;
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'bratcode-login-'));
-  onStatus?.('opening a window - sign in to genspark.ai there');
-  const ctx = await chromium.launchPersistentContext(profile, { executablePath: exe, headless: false, viewport: { width: 1000, height: 760 }, args: ['--no-first-run', '--no-default-browser-check'] });
+  let ctx;
+  const closeOnAbort = () => { ctx?.close().catch(() => {}); };
   try {
+    onStatus?.('starting browser...');
+    ctx = await chromium.launchPersistentContext(profile, {
+      executablePath: exe, headless: false, timeout: 20000,
+      viewport: { width: 1000, height: 760 },
+      args: ['--no-first-run', '--no-default-browser-check'],
+    });
+    signal?.addEventListener('abort', closeOnAbort, { once: true });
+    if (signal?.aborted) throw new Error('cancelled');
     const page = ctx.pages()[0] || (await ctx.newPage());
+    await page.bringToFront();
+    onStatus?.('browser opened - sign in to genspark.ai there');
     await page.goto(cfg.ORIGIN + '/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     const t0 = Date.now();
     for (;;) {
       if (signal?.aborted) throw new Error('cancelled');
       if (Date.now() - t0 > timeoutMs) throw new Error('login timed out');
-      const cookies = await ctx.cookies(cfg.ORIGIN);
-      if (cfg.hasAuthCookie(cookies) && (await looksSignedIn(cookies))) {
-        onStatus?.('signed in, saving the session');
-        return addFromCookies(store, cookies);
+      const pages = ctx.pages().filter((p) => !p.isClosed());
+      if (!pages.length) throw new Error('login window was closed before sign-in completed');
+      // Verify inside the real signed-in browser, not with a separate Node TLS session.
+      const current = pages.find((p) => { try { return new URL(p.url()).origin === cfg.ORIGIN; } catch { return false; } });
+      if (current) {
+        const json = await current.evaluate(async (userPath) => {
+          try {
+            const res = await fetch(userPath, { credentials: 'include', signal: AbortSignal.timeout(8000) });
+            return res.ok ? await res.json() : null;
+          } catch { return null; }
+        }, cfg.USER_PATH).catch(() => null);
+        const info = parseUserInfo(json);
+        if (info.ok) {
+          onStatus?.('signed in, saving the session');
+          return saveVerifiedCookies(store, await ctx.cookies(cfg.ORIGIN), info);
+        }
       }
-      await new Promise((r) => setTimeout(r, 1500));
+      await delay(1500, undefined, { signal });
     }
+  } catch (e) {
+    if (signal?.aborted) throw new Error('cancelled');
+    if (!ctx) throw new Error('login browser failed to start: ' + String(e.message || e).split('\n')[0] + '. Install Google Chrome or rerun the installer.');
+    throw e;
   } finally {
-    try { await ctx.close(); } catch { /* ignore */ }
+    signal?.removeEventListener('abort', closeOnAbort);
+    try { await ctx?.close(); } catch { /* ignore */ }
     try { fs.rmSync(profile, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 }
 
-async function looksSignedIn(cookies) {
-  // the cookie alone also appears for anonymous visitors; confirm with /api/user
+export async function addFromCookies(store, cookies, { verifyInBrowser } = {}) {
   const { CookieJar } = await import('./jar.js');
-  const j = new CookieJar(path.join(os.tmpdir(), 'bc-probe-' + process.pid + '.json'));
-  j.setAll(cookies.map((c) => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, expires: c.expires, secure: c.secure, httpOnly: c.httpOnly })));
-  const u = await fetchUserInfo(j, 8000);
-  return !!u.ok;
+  const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-add-'));
+  const tmp = new CookieJar(path.join(probeDir, 'cookies.json'));
+  // A probe may absorb refreshed cookies; remove its private temporary jar on every exit.
+  try {
+    tmp.setAll(cookies);
+    let info = await fetchUserInfo(tmp, 10000);
+    if (!info.ok && !info.dead && verifyInBrowser) {
+      const browserResult = await verifyInBrowser(cookies);
+      if (browserResult.info.ok) tmp.setAll(browserResult.cookies);
+      info = browserResult.info;
+    }
+    if (!info.ok) throw new Error(sessionError(info));
+    return saveVerifiedCookies(store, tmp.list, info);
+  } finally { fs.rmSync(probeDir, { recursive: true, force: true }); }
 }
 
-export async function addFromCookies(store, cookies) {
-  const { CookieJar } = await import('./jar.js');
-  const tmp = new CookieJar(path.join(os.tmpdir(), 'bc-add-' + process.pid + '-' + Date.now() + '.json'));
-  tmp.setAll(cookies.map((c) => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, expires: c.expires, secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite })));
-  const info = await fetchUserInfo(tmp, 10000);
-  if (!info.ok) throw new Error('these cookies are not a signed-in genspark session (' + info.reason + ')');
-  const dup = store.list().find((a) => a.email && a.email === info.email);
-  if (dup) { store.jar(dup.id).replaceAll(tmp.list); store.update(dup.id, (a) => { delete a.dead; delete a.loggedOutAt; }); return { account: store.get(dup.id), updated: true }; }
-  const acc = store.add({ name: info.name || info.email, email: info.email, cookies: tmp.list });
+export function sessionError(info) {
+  if (info.reason === 'not-login') return 'session expired or signed out: sign in again';
+  if (info.reason === 'blocked') return 'Genspark blocked the API check (HTTP 403 / browser challenge); cookies were not proven invalid. Use a sign-in window or retry later.';
+  return `cannot verify Genspark session: ${info.reason}${info.status ? ` (HTTP ${info.status})` : ''}; retry or use a sign-in window`;
+}
+
+function saveVerifiedCookies(store, cookies, info) {
+  const dup = store.list().find((a) => a.email && a.email.toLowerCase() === info.email.toLowerCase());
+  if (dup) { store.jar(dup.id).replaceAll(cookies); store.update(dup.id, (a) => { delete a.dead; delete a.loggedOutAt; }); return { account: store.get(dup.id), updated: true }; }
+  const acc = store.add({ name: info.name || info.email, email: info.email, cookies });
   return { account: acc, updated: false };
 }
 
@@ -88,7 +130,7 @@ export function listBrowserProfiles() {
 // accounts.json plus one real Chromium profile per account under <folder>/Partitions/account_<id>/.
 // Each profile's Cookies db is encrypted exactly like a browser's, but the Keychain item is named
 // after the app's productName ("Claude Safe Storage" / account "Claude") instead of a browser name.
-// We read it the same read-only way: never touch the app's files, never run while it's open.
+// SQLite's read-only backup includes committed WAL transactions without altering the app's data.
 export function detectClaudehackKeychainName(dir) {
   // best-effort: the keychain service name is "<productName> Safe Storage"; claudehack's
   // productName is "Claude", but let the caller override via BRATCODE_CLAUDEHACK_KEYCHAIN.
@@ -121,69 +163,117 @@ export function readClaudehackCookies(entry, keychainName) {
   return readGensparkCookies({ keychain: keychainName || detectClaudehackKeychainName(), cookies: entry.cookies });
 }
 
+// Lazy shared browser, isolated context per account; never merges different users' cookies.
+export function createImportVerifier({ browserType, findExecutable = findBrowserExecutable } = {}) {
+  let browserPromise;
+  return {
+    async verify(cookies) {
+      browserPromise ||= (async () => {
+        const chromium = browserType || (await import('playwright-core')).chromium;
+        const executablePath = findExecutable();
+        if (!executablePath) throw new Error('no browser for session verification; rerun the installer');
+        return chromium.launch({ executablePath, headless: true, timeout: 20000 });
+      })();
+      const browser = await browserPromise;
+      const ctx = await browser.newContext();
+      try {
+        const { CookieJar } = await import('./jar.js');
+        const jar = new CookieJar(''); // normalization only; this jar is never persisted
+        jar.setAll(cookies);
+        await ctx.addCookies(jar.toPlaywright());
+        const page = await ctx.newPage();
+        const res = await page.goto(cfg.ORIGIN + cfg.USER_PATH, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        if (!res || !res.ok()) {
+          return { info: { ok: false, reason: res?.status() === 401 ? 'not-login' : 'blocked' }, cookies: [] };
+        }
+        let json; try { json = await res.json(); } catch { /* challenge / non-JSON */ }
+        return { info: json ? parseUserInfo(json) : { ok: false, reason: 'blocked' }, cookies: await ctx.cookies(cfg.ORIGIN) };
+      } finally { await ctx.close(); }
+    },
+    async close() { try { await (await browserPromise)?.close(); } catch { /* failed launch */ } },
+  };
+}
+
 /** Import every account from a claudehack userData folder (read-only, never touches claudehack's files). */
-export async function importFromClaudehackDir(store, dir, { onStatus } = {}) {
+export async function importFromClaudehackDir(store, dir, { onStatus, readCookies = readClaudehackCookies, createVerifier = createImportVerifier } = {}) {
   const entries = listClaudehackAccounts(dir);
   const keychain = detectClaudehackKeychainName(dir);
   const added = [], failed = [];
-  for (const e of entries) {
-    onStatus?.(e.name);
-    try {
-      const cookies = readClaudehackCookies(e, keychain);
-      if (!cfg.hasAuthCookie(cookies)) { failed.push({ from: e.name, error: 'no session cookie (logged out?)' }); continue; }
-      const r = await addFromCookies(store, cookies);
-      added.push({ ...r, from: e.name });
-    } catch (err) { failed.push({ from: e.name, error: String(err.message || err) }); }
-  }
+  const verifier = createVerifier();
+  try {
+    for (const e of entries) {
+      onStatus?.(e.name);
+      try {
+        const cookies = readCookies(e, keychain);
+        if (!cfg.hasAuthCookie(cookies)) { failed.push({ from: e.name, error: 'no session cookie (logged out?)' }); continue; }
+        const r = await addFromCookies(store, cookies, { verifyInBrowser: (c) => verifier.verify(c) });
+        added.push({ ...r, from: e.name });
+      } catch (err) { failed.push({ from: e.name, error: String(err.message || err) }); }
+    }
+  } finally { await verifier.close(); }
   return { added, failed, scanned: entries.length };
 }
 
 // Chromium on macOS: v10 + AES-128-CBC, key = PBKDF2(keychain password, 'saltysalt', 1003, 16), iv = 16 spaces.
-export function decryptChromiumCookie(buf, key, dbVersion = 0) {
-  if (!buf || buf.length < 4) return '';
+export function decryptChromiumCookie(buf, key, dbVersion = 0, domain) {
+  if (!buf || !buf.length) return '';
   const tag = buf.subarray(0, 3).toString();
   if (tag !== 'v10' && tag !== 'v11') return buf.toString('utf8');
   const d = crypto.createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20));
   let out = Buffer.concat([d.update(buf.subarray(3)), d.final()]);
-  if (dbVersion >= 24 && out.length > 32) out = out.subarray(32); // newer Chrome prefixes the host hash
+  const hostHash = domain === undefined ? null : crypto.createHash('sha256').update(domain).digest();
+  const hasHash = hostHash && out.length >= 32 && out.subarray(0, 32).equals(hostHash);
+  if (dbVersion >= 24 && hostHash && !hasHash) throw new Error('cookie host hash mismatch (wrong Keychain key or damaged database)');
+  if (hasHash || (dbVersion >= 24 && out.length >= 32)) out = out.subarray(32);
   return out.toString('utf8');
 }
 export const deriveKey = (password) => crypto.pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1');
 
-/** Read-only: copies the Cookies DB to a temp file, never touches the browser profile. */
+/** Read-only SQLite snapshot includes committed WAL data even while the app is open. */
+export function snapshotCookieDatabase(source, destination, run = execFileSync) {
+  run('sqlite3', ['-readonly', source, '.timeout 5000', `.backup ${JSON.stringify(destination)}`], {
+    encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+/** Read-only: snapshots the Cookies DB to a temp file, never changes the browser profile. */
 export function readGensparkCookies(profile) {
   if (!IS_MAC) throw new Error('browser import works on macOS only');
   let pass = '';
   try { pass = execFileSync('security', ['find-generic-password', '-w', '-s', `${profile.keychain} Safe Storage`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
   catch { throw new Error(`macOS Keychain refused access to "${profile.keychain} Safe Storage". Click "Allow" in the system dialog and retry.`); }
   const key = deriveKey(pass);
-  const tmp = path.join(os.tmpdir(), `bc-cookies-${process.pid}-${Date.now()}.db`);
-  fs.copyFileSync(profile.cookies, tmp);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-cookies-'));
+  const tmp = path.join(tmpDir, 'Cookies');
   try {
+    snapshotCookieDatabase(profile.cookies, tmp);
     const q = (sql) => execFileSync('sqlite3', ['-json', tmp, sql], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
     let ver = 0; try { ver = Number(JSON.parse(q("select value from meta where key='version'") || '[]')[0]?.value) || 0; } catch { /* old schema */ }
     const rows = JSON.parse(q("select host_key as domain, name, hex(encrypted_value) as enc, value, path, expires_utc, is_secure as secure, is_httponly as httpOnly from cookies where host_key like '%genspark.ai'") || '[]');
     return rows.map((r) => {
       let value = r.value || '';
-      if (!value && r.enc) { try { value = decryptChromiumCookie(Buffer.from(r.enc, 'hex'), key, ver); } catch { value = ''; } }
+      if (!value && r.enc) { try { value = decryptChromiumCookie(Buffer.from(r.enc, 'hex'), key, ver, r.domain); } catch { value = ''; } }
       const expires = r.expires_utc > 0 ? Math.floor(r.expires_utc / 1e6 - 11644473600) : -1;
       return { name: r.name, value, domain: r.domain, path: r.path || '/', expires, secure: !!r.secure, httpOnly: !!r.httpOnly };
     }).filter((c) => c.value);
-  } finally { try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ } }
+  } finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ } }
 }
 
 export async function importFromBrowsers(store, { onStatus } = {}) {
   const profiles = listBrowserProfiles();
   const added = [], failed = [];
-  for (const p of profiles) {
-    onStatus?.(`${p.browser} / ${p.profile}`);
-    try {
-      const cookies = readGensparkCookies(p);
-      if (!cfg.hasAuthCookie(cookies)) continue;
-      const r = await addFromCookies(store, cookies);
-      added.push({ ...r, from: `${p.browser}/${p.profile}` });
-    } catch (e) { failed.push({ from: `${p.browser}/${p.profile}`, error: String(e.message || e) }); }
-  }
+  const verifier = createImportVerifier();
+  try {
+    for (const p of profiles) {
+      onStatus?.(`${p.browser} / ${p.profile}`);
+      try {
+        const cookies = readGensparkCookies(p);
+        if (!cfg.hasAuthCookie(cookies)) continue;
+        const r = await addFromCookies(store, cookies, { verifyInBrowser: (c) => verifier.verify(c) });
+        added.push({ ...r, from: `${p.browser}/${p.profile}` });
+      } catch (e) { failed.push({ from: `${p.browser}/${p.profile}`, error: String(e.message || e) }); }
+    }
+  } finally { await verifier.close(); }
   return { added, failed, scanned: profiles.length };
 }
 
