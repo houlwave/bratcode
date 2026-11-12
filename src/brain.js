@@ -26,6 +26,9 @@ export async function createBrain(o = {}) {
   const store = o.store || new AccountStore();
   const pool = new Pool({ store, ...(o.poolOptions || {}) });
   const recaptcha = o.recaptcha === false ? null : new Recaptcha({ store });
+  // The token, cookies and API requests must share Chromium's account context.
+  // Explicit recaptcha:false is retained for offline tests / demo integrations.
+  if (recaptcha) store.setTransport((id, url, opts) => recaptcha.fetch(id, url, opts));
   const tg = createTelegramAgent(o.tgService || new TgService());
   const getSettings = o.settings || readSettings;
   const brain = { store, pool, recaptcha, tg, onConfirm: null, sandbox: null, runner: null };

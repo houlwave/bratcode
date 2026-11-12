@@ -109,19 +109,35 @@ under the hood this decrypts each account's `Cookies` database the same way the 
 ### import / sign-in troubleshooting
 
 - Cookie import now uses a read-only SQLite snapshot, including committed `Cookies-wal` data. Copying just `Cookies` could previously read stale sessions. Chromium v24 host hashes are stripped and validated before sending cookie values.
-- `/api/user` supports both top-level and `data`-wrapped user records. If the plain HTTP check cannot verify a session, the importer retries in Chromium, with a separate context per account. Accounts are saved only after a successful user check; expired sessions are not silently imported as working accounts.
+- `/api/user` supports both top-level and `data`-wrapped user records. If the plain HTTP import probe cannot verify a session, the importer retries in Chromium, with a separate context per account. Accounts are saved only after a successful user check; expired sessions are not silently imported as working accounts.
 - HTTP 403 / browser challenges, request failures, and expired sessions have distinct messages. `/accounts` wraps diagnostics across multiple lines instead of truncating them to “these cookies are”. If a browser challenge still prevents verification, use `a` to sign in manually or retry later; import does not bypass challenges.
 - Sign-in (`/accounts` → `a`) selects a window-capable executable, focuses the window, verifies the user inside that browser, and cleans temporary profiles even after failed launches or cancellation. `esc` cancels; on Linux a graphical desktop is required. Set `CHROMIUM_PATH` to a full Chrome/Chromium executable if discovery fails (not `chrome-headless-shell`).
 - macOS import needs the system `security` and `sqlite3` commands and permission to read the original app's Safe Storage Keychain item. Cookies encrypted on a different Mac need the original Keychain key, not just a copied profile folder.
 
 Regression tests cover WAL snapshots, v24 decryption, browser selection, isolated verification, failed/cancelled sign-in, and a batch of **148 synthetic profiles**. They do not prove that any particular real session is still valid. Real macOS Keychain prompts and interactive Genspark sign-in must be checked on the user's Mac.
 
-### message / Cloudflare troubleshooting
+### message transport / Cloudflare
 
-- Message responses must be SSE (`text/event-stream`). HTML/JSON pages returned with HTTP 200 and empty/invalid SSE streams now fail explicitly instead of producing a blank successful track.
-- Cloudflare verification is detected by `cf-mitigated: challenge` or challenge HTML markers. The terminal shows a short actionable error, never the challenge HTML/scripts/tokens. A blocked send does not mark the account expired or exhaust its credits, and does not replay the prompt across other accounts.
-- If a send is blocked, open `/accounts`, press `a` to sign in in the browser window, then retry the message manually. If verification still blocks Node's HTTP connection, retry later. Browser cookies and a reCAPTCHA token do not guarantee that Cloudflare will accept a separate Node connection; this change does not bypass Cloudflare or automatically resend messages.
-- Regression tests use local mock responses for HTTP 403/503 challenges, HTTP 200 challenge pages, unexpected response formats, empty streams, bounded error bodies, and preserved JSON validation errors. Live message delivery through Cloudflare still needs verification on the user's machine.
+- `claudehack-v8.2` sends messages through Chromium's `electron.net` with the account session. Its **High** setting selects `type: "ai_chat"`; it does not add `reasoning_effort` to that payload. bratcode uses the same ai_chat fields and enables web search for the sandbox URL.
+- The live CLI now sends API requests through **in-page Chromium fetch in the same isolated account context used for reCAPTCHA**. Previously only the token was obtained in Chromium, while the actual POST used Node fetch with a hardcoded Chrome UA. Cookies alone do not make those two network stacks interchangeable.
+- Chromium manages cookies, TLS, User-Agent, client hints, Origin and Referer. The response is bridged incrementally with backpressure, so text arrives before the request ends. Escape aborts the actual browser reader. Refreshed HttpOnly cookies are saved to the private jar; reimport/sign-in updates the cached context and invalidates old prefetched tokens.
+- The normal brain attaches this transport to existing and future account jars: chat, balances, abort and sharing all use it. There is **no silent fallback to Node** when Chromium fails. Full Chrome's modern headless mode is preferred; install Chrome or rerun the installer if no browser is found. `BRATCODE_NO_RECAPTCHA=1` disables token minting, not the browser transport. Explicit `createBrain({ recaptcha: false })` is retained for offline test integrations.
+- Message responses must be SSE (`text/event-stream`). HTML/JSON pages returned with HTTP 200 and empty/invalid SSE streams fail explicitly instead of producing a blank successful track. Remaining Cloudflare challenges are reported without HTML/scripts/tokens and without replaying the prompt across the pool; this is not a CAPTCHA solver or a guarantee against server-side blocking.
+- Update and restart bratcode to load the new transport. Existing imported accounts remain usable; deleting or reimporting them is not required by this change. If the browser itself still receives a challenge, try a manual sign-in via `/accounts` → `a`, then retry deliberately.
+
+### tests
+
+`npm test` runs the pool, sandbox, Telegram, TUI, and browser-transport tests against local fixtures. Chromium integration runs when a browser is found; set `BRATCODE_REQUIRE_BROWSER_TESTS=1` to require it instead of skipping.
+
+```bash
+# Use your installed Chrome, or install the test browser first:
+npx playwright-core install chromium
+BRATCODE_REQUIRE_BROWSER_TESTS=1 npm test
+# Override executable discovery when needed:
+CHROMIUM_PATH=/path/to/chrome BRATCODE_REQUIRE_BROWSER_TESTS=1 npm test
+```
+
+On minimal Linux systems install Chromium's OS libraries with `npx playwright-core install-deps chromium`. Browser integration checks an actual Chromium POST while Node fetch is disabled, same-account tokens and HttpOnly cookies, streaming before EOF, cancellation/timeouts, cookie refresh, sign-in replacement, redirects, challenge handling, and the default brain wiring. No live Genspark session or paid message is used in these tests. The next verification step is a real send on the user's machine; local integration does not prove that Cloudflare accepts a particular live session.
 
 ## what it does
 
@@ -130,7 +146,7 @@ one prompt = **one continuous request**. the model gets a private link to a smal
 - **type while it works.** text sent during a run does not start a new request: it lands in the run's inbox and the agent reads it with its next step (`+ your text` in the log). no new limits are spent.
 - **your computer is the sandbox.** files anywhere on disk, `exec`, background services, browser and vision tools, `osascript` for Calendar / Notes / Reminders / Finder / Music, screenshots, clipboard. every file change is backed up, `/undo` reverts it.
 - **your telegram.** `/tg` shows a QR code in the terminal (half blocks), supports 2fa. then: "find the family chat, read the weekend plans, text mom that we are coming".
-- **account pool.** accounts live in `~/.bratcode-data`. the best usable account is picked automatically; when credits run out mid-answer the next one continues in the same project, seamlessly. add accounts with `/accounts` (sign in in a window, import read-only from Chrome / Brave / Edge, or pin your `claudehack` folder with `p` and pull its sessions with `c` — see below).
+- **account pool.** accounts live in `~/.bratcode-data`. the best usable account is picked automatically; when credits run out mid-answer the next one continues in the same project, seamlessly. add accounts with `/accounts` (sign in in a window, import read-only from Chrome / Brave / Edge, or pin your `claudehack` folder with `p` and pull its sessions with `c` — see above).
 - **live balance.** refreshed the moment you start typing a prompt, and again right after every request. the bottom line always shows it.
 - **side a / side b.** `A brat` runs sensitive actions (like sending a telegram message) immediately. `B demure` plans first and asks you with a card (`enter` allow, `esc` deny).
 
@@ -138,7 +154,7 @@ the bottom line: `~/dir:branch · tunnel · tg · 12,340 cr`.
 
 ## status
 
-v1.0. the tui, the sandbox, telegram and the pool are connected and covered by tests (`npm test`, mock genspark + fake telegram, no network needed). the https tunnel is a cloudflared quick tunnel that the installer downloads for you.
+v1.0. the tui, the sandbox, telegram and the pool are connected and covered by tests (`npm test`, mock genspark + fake telegram + local Chromium integration). the https tunnel is a cloudflared quick tunnel that the installer downloads for you. This is a local Node CLI, not a deployed web service; account state stays in `~/.bratcode-data` and this transport change requires no cloud deployment.
 
 ## how it is built
 
@@ -151,10 +167,10 @@ src/brain.js        wires pool + runner + sandbox + telegram + captcha
 src/overlays.js     /tg qr, /accounts, /model, approval card
 src/sandbox/        the mac as a GET agent: server, files, edit, code, exec, browser, macos, undo, inbox, tunnel
 src/telegram/       personal telegram (gramjs): qr login, tg_* agent commands
-src/pool/           accounts, live balance, ai_chat sse runner, handoff
+src/pool/           accounts, live balance, Chromium fetch bridge, ai_chat sse runner, handoff
 src/term.js         cell buffer + diff renderer, truecolor / 256 fallback
 src/cover.js        pixel font + gaussian blur drawn with half-block cells
-tests/              node tests/run-all.js (pool, sandbox, telegram, tui)
+tests/              node tests/run-all.js (browser transport, pool, sandbox, telegram, tui)
 scripts/            headless renderer that makes the screenshots above
 ```
 

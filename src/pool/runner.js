@@ -192,7 +192,7 @@ export class Runner extends EventEmitter {
 
         // A challenge is not an expired session or a credit problem. Do not replay
         // the prompt across the pool (or retry an unexpected successful response).
-        if (err.code === 'cloudflare-challenge' || err.code === 'invalid-stream-response') throw err;
+        if (err.code === 'cloudflare-challenge' || err.code === 'invalid-stream-response' || err.code === 'browser-session-unavailable') throw err;
 
         // network / server error -> rotate to the next account
         dev('warn', `"${acc.name}": ${String(err.message).slice(0, 160)}`);

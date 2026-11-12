@@ -1,4 +1,5 @@
-// POST /api/agent/ask_proxy (ai_chat) -> SSE stream. Port of sse-client.js + ask-payload.js (ai_chat branch) over fetch.
+// POST /api/agent/ask_proxy (ai_chat / High) -> SSE stream.
+// The live jar routes fetch through Chromium, sharing the token's account session.
 import { randomUUID, randomBytes } from 'node:crypto';
 import * as cfg from './config.js';
 import { gsRequest } from './net.js';
@@ -102,7 +103,7 @@ export function askStream(jar, opts, handlers = {}) {
     h.onMeta?.({ kind: 'response', status: r.status });
     if (r.creditRedirect) { const e = new Error('CREDIT_EXHAUSTED: redirect'); e.creditExhausted = true; e.statusCode = 402; throw e; }
     try { await validateStreamResponse(r); }
-    catch (err) { if (r.timer) clearTimeout(r.timer); throw err; }
+    catch (err) { r.cleanup?.(); throw err; }
 
     let creditExhausted = false, creditNote = '', lastTextMsgId = '';
     const result = {
@@ -186,7 +187,7 @@ export function askStream(jar, opts, handlers = {}) {
       finalize();
       if (aborted) { result.aborted = true; return result; }
       throw e;
-    } finally { if (r.timer) clearTimeout(r.timer); }
+    } finally { r.cleanup?.(); }
 
     finalize();
     h.onMeta?.({ kind: 'end' });

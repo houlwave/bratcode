@@ -63,9 +63,25 @@ export class AccountStore {
     try { fs.rmSync(partitionDir(id), { recursive: true, force: true }); } catch { /* ignore */ }
   }
 
+  // Transport is attached to jars, including jars already cached before startup.
+  // Tests/import probes can keep plain HTTP; the live brain uses Chromium.
+  setTransport(fetchForAccount) {
+    this.fetchForAccount = fetchForAccount;
+    for (const [id, jar] of this.jars) this._attachTransport(id, jar);
+  }
+
+  _attachTransport(id, jar) {
+    if (this.fetchForAccount) jar.fetch = (url, opts) => this.fetchForAccount(id, url, opts);
+    else delete jar.fetch;
+  }
+
   jar(id) {
     let j = this.jars.get(id);
-    if (!j) { j = new CookieJar(path.join(partitionDir(id), 'cookies.json')); this.jars.set(id, j); }
+    if (!j) {
+      j = new CookieJar(path.join(partitionDir(id), 'cookies.json'));
+      this._attachTransport(id, j);
+      this.jars.set(id, j);
+    }
     return j;
   }
 }
