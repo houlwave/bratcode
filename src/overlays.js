@@ -4,9 +4,9 @@ import { BOLD } from './term.js';
 import { C } from './theme.js';
 import { wrapText } from './text.js';
 import { qrHalfBlocks } from './telegram/qr.js';
-import { loginInWindow, importFromBrowsers } from './pool/login.js';
+import { loginInWindow, importFromBrowsers, importFromClaudehackDir, looksLikeClaudehackDir } from './pool/login.js';
 import { currentCatalog, resolveModelId } from './pool/models.js';
-import { readSettings, saveSettings } from './paths.js';
+import { readSettings, saveSettings, DEFAULT_CLAUDEHACK_DIR } from './paths.js';
 
 const WHITE = 0xffffff;
 const BLACK = 0x000000;
@@ -149,6 +149,9 @@ export class AccountsOverlay {
     this.armDel = '';
     this.ctl = null;
     this.pref = readSettings().preferredAccountId || '';
+    this.claudehackDir = readSettings().claudehackDir || '';
+    this.editingPath = false; // 'p': type/paste the folder path, then enter to save
+    this.pathInput = '';
   }
 
   rows() { return (this.app.bal && this.app.bal.accounts) || []; }
@@ -162,6 +165,23 @@ export class AccountsOverlay {
 
   key(k) {
     const rows = this.rows();
+    if (this.editingPath) {
+      if (k.name === 'escape' || (k.ctrl && k.name === 'c')) { this.editingPath = false; return; }
+      if (k.name === 'enter') {
+        const dir = this.pathInput.trim().replace(/^~(?=$|\/)/, process.env.HOME || '');
+        this.editingPath = false;
+        if (!dir) { this.claudehackDir = ''; saveSettings({ claudehackDir: '' }); this.msg = 'claudehack folder unpinned'; return; }
+        if (!looksLikeClaudehackDir(dir)) { this.msg = `no accounts.json found in ${dir}`; return; }
+        this.claudehackDir = dir;
+        saveSettings({ claudehackDir: dir });
+        this.msg = `pinned: ${dir}`;
+        return;
+      }
+      if (k.name === 'backspace') { this.pathInput = Array.from(this.pathInput).slice(0, -1).join(''); return; }
+      if (k.name === 'char' && !k.alt) { this.pathInput += k.text; return; }
+      if (k.name === 'paste') { this.pathInput += k.text; return; }
+      return;
+    }
     if (k.name === 'escape' || (k.ctrl && k.name === 'c')) { try { this.ctl?.abort(); } catch { /* ignore */ } return 'close'; }
     if (k.name === 'up') { this.sel = Math.max(0, this.sel - 1); this.armDel = ''; return; }
     if (k.name === 'down') { this.sel = Math.min(Math.max(0, rows.length - 1), this.sel + 1); this.armDel = ''; return; }
@@ -190,6 +210,20 @@ export class AccountsOverlay {
           const bad = r.failed[0] ? `, ${r.failed.length} failed: ${r.failed[0].error}` : '';
           return `imported ${r.added.length} from ${r.scanned} profiles${bad}`.slice(0, 110);
         });
+      case 'p':
+        this.editingPath = true;
+        this.pathInput = this.claudehackDir || DEFAULT_CLAUDEHACK_DIR || '';
+        return;
+      case 'c': {
+        const dir = this.claudehackDir || DEFAULT_CLAUDEHACK_DIR;
+        if (!dir) { this.msg = 'no claudehack folder pinned yet: press p to set one'; return; }
+        return this.run(`reading claudehack accounts from ${dir}...`, async () => {
+          const r = await importFromClaudehackDir(store, dir, { onStatus: (t) => { this.msg = t; } });
+          await pool.refreshAll();
+          const bad = r.failed[0] ? `, ${r.failed.length} failed: ${r.failed[0].error}` : '';
+          return `imported ${r.added.length} from ${r.scanned} claudehack accounts${bad}`.slice(0, 120);
+        });
+      }
       case 'r':
         return this.run('refreshing balances...', async () => { await pool.refreshAll(); const b = pool.summary(); return `${fmtCredits(b.total)} credits on ${b.usable}/${b.count}`; });
       case 'd': {
@@ -210,10 +244,26 @@ export class AccountsOverlay {
 
   draw(s, now, color) {
     const rows = this.rows();
-    const p = panel(s, 76, 9 + Math.max(2, Math.min(rows.length, 10)), 'accounts', color);
+    const extra = this.editingPath ? 2 : 0;
+    const p = panel(s, 76, 9 + extra + Math.max(2, Math.min(rows.length, 10)), 'accounts', color);
     const bal = this.app.bal;
     if (bal) s.text(p.x + 15, p.y + 1, `${fmtCredits(bal.total)} credits  ${bal.usable}/${bal.count} usable`, C.dim, C.panel, 0, p.x + p.pw - 8);
     let y = p.y + 3;
+    if (this.editingPath) {
+      s.text(p.ix, y, 'claudehack folder (empty = unpin):', C.text, C.panel);
+      y++;
+      const line = this.pathInput || ' ';
+      s.text(p.ix, y, line, C.fg, C.panel, 0, p.ix + p.iw);
+      const on = Math.floor(now / 530) % 2 === 0;
+      if (on) s.put(p.ix + Array.from(this.pathInput).length, y, ' ', C.bg, color);
+      y += 2;
+      s.text(p.ix, y, 'enter  save    esc  cancel', C.dim, C.panel);
+      return;
+    }
+    if (this.claudehackDir) {
+      s.text(p.ix, y, `claudehack: ${this.claudehackDir}`, C.dim, C.panel, 0, p.ix + p.iw);
+      y++;
+    }
     if (!rows.length) {
       s.text(p.ix, y, 'no accounts yet. press i to import from your browsers, or a to sign in.', C.text, C.panel, 0, p.ix + p.iw);
       y += 2;
@@ -238,7 +288,7 @@ export class AccountsOverlay {
     }
     y = p.y + p.ph - 4;
     if (this.msg) s.text(p.ix, y, this.msg, this.working ? color : C.text, C.panel, 0, p.ix + p.iw);
-    s.text(p.ix, p.y + p.ph - 2, 'a sign in   i import   r refresh   d remove   enter pin', C.dim, C.panel, 0, p.ix + p.iw);
+    s.text(p.ix, p.y + p.ph - 2, 'a sign in   i import   c claudehack   p set folder   r refresh   d remove   enter pin', C.dim, C.panel, 0, p.ix + p.iw);
   }
 }
 

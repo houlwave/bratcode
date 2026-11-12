@@ -12,7 +12,7 @@ import { parseMemberBenefits, isModelLockedFor, modelKey } from '../src/pool/mod
 import { looksCreditExhaustedStrict, stripCreditNotice } from '../src/pool/config.js';
 import { parseModelId, resolveModelId, buildCatalog } from '../src/pool/models.js';
 import { CookieJar } from '../src/pool/jar.js';
-import { decryptChromiumCookie, deriveKey } from '../src/pool/login.js';
+import { decryptChromiumCookie, deriveKey, listClaudehackAccounts, looksLikeClaudehackDir } from '../src/pool/login.js';
 import crypto from 'node:crypto';
 import { createSandbox } from '../src/sandbox/server.js';
 
@@ -251,6 +251,19 @@ await test('stop() aborts the run and asks the server to abort', async () => {
 await test('stripCreditNotice keeps real text sharing a line with the notice', () => {
   eq(stripCreditNotice('Сделал первую часть. Ваш баланс кредитов отрицательный. Этот запуск остановлен. Пожалуйста, пополните, чтобы продолжить.'), 'Сделал первую часть.');
   eq(stripCreditNotice('Только плашка. Your credit balance is negative.'), 'Только плашка.');
+});
+
+await test('claudehack folder import: reads accounts.json + Partitions/account_<id>/Cookies', () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'claudehack-'));
+  eq(looksLikeClaudehackDir(dir), false);
+  fs.writeFileSync(path.join(dir, 'accounts.json'), JSON.stringify({ accounts: [{ id: 'abc123', name: 'Work', email: 'work@x.io' }, { id: 'noprofile', name: 'Ghost' }] }));
+  eq(looksLikeClaudehackDir(dir), true);
+  const partDir = path.join(dir, 'Partitions', 'account_abc123', 'Network');
+  fs.mkdirSync(partDir, { recursive: true });
+  fs.writeFileSync(path.join(partDir, 'Cookies'), 'fake-sqlite-db');
+  const found = listClaudehackAccounts(dir);
+  eq(found.length, 1);
+  eq(found[0], { id: 'abc123', name: 'Work', email: 'work@x.io', cookies: path.join(partDir, 'Cookies') });
 });
 
 await test('failure emits "failed" (never the reserved "error") and does not crash without listeners', async () => {

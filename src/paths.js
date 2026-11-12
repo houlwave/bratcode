@@ -22,6 +22,10 @@ export const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 export const TG_SESSION_FILE = path.join(DATA_DIR, 'telegram.json');
 export const MODELS_CACHE_FILE = path.join(DATA_DIR, 'models-cache.json');
 
+// claudehack (the Electron Genspark account manager) keeps its own accounts.json
+// + one Chromium partition per account under this folder by default on macOS.
+export const DEFAULT_CLAUDEHACK_DIR = IS_MAC ? path.join(HOME, 'Library', 'Application Support', 'claudehack') : '';
+
 export function ensureDirs() {
   for (const d of [DATA_DIR, PARTITIONS_DIR, LOGS_DIR, SHOTS_DIR, MEM_DIR, BACKUPS_DIR, BIN_DIR, BROWSERS_DIR]) {
     try { fs.mkdirSync(d, { recursive: true, mode: 0o700 }); } catch {}
@@ -123,6 +127,7 @@ export function readSettings() {
   const def = {
     model: 'claude-opus-5-5',
     preferredAccountId: '',
+    claudehackDir: '',
   };
   const s = readJsonSafe(SETTINGS_FILE, {});
   return { ...def, ...(s && typeof s === 'object' ? s : {}) };

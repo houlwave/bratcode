@@ -96,6 +96,16 @@ env: `BRATCODE_COLORS=256`, `BRATCODE_NO_TUNNEL=1` (local sandbox only), `BRATCO
 
 works in any modern terminal. if colors look off (macOS Terminal.app has no truecolor) it falls back to 256 colors automatically; force it with `BRATCODE_COLORS=256`. for the best result use iTerm2, Ghostty, WezTerm, kitty or Warp. the layout adapts: below 80 columns the cover hides and only the input stays.
 
+## pull accounts from claudehack
+
+if you used the `claudehack` desktop app before, its accounts live in `~/Library/Application Support/claudehack`: an `accounts.json` plus one real Chromium profile per account in `Partitions/account_<id>/`. `bratcode` can read that folder read-only and import every live session into its own pool — nothing in `claudehack`'s files is touched or modified.
+
+1. open `/accounts`
+2. press `p` to pin the folder (defaults to the path above; paste a different one if yours lives elsewhere, e.g. a copy on an external drive)
+3. press `c` to import every account found there
+
+under the hood this decrypts each account's `Cookies` database the same way the browser-import (`i`) does, except the macOS Keychain item is named after `claudehack`'s app name (`Claude Safe Storage`) instead of a browser. macOS will ask you to allow Keychain access the first time; click "Allow" (or "Always Allow" to skip the prompt on future imports). set `BRATCODE_CLAUDEHACK_KEYCHAIN=<name>` if your copy of claudehack was renamed and uses a different Keychain item. the pinned folder is remembered in `~/.bratcode-data/settings.json`, so `c` re-imports (and refreshes) with one keystroke next time.
+
 ## what it does
 
 one prompt = **one continuous request**. the model gets a private link to a small server on your mac and drives it with plain `GET` requests: read and edit files, run commands, look at pages, control macOS, use telegram. you watch every step appear under your track.
@@ -103,7 +113,7 @@ one prompt = **one continuous request**. the model gets a private link to a smal
 - **type while it works.** text sent during a run does not start a new request: it lands in the run's inbox and the agent reads it with its next step (`+ your text` in the log). no new limits are spent.
 - **your computer is the sandbox.** files anywhere on disk, `exec`, background services, browser and vision tools, `osascript` for Calendar / Notes / Reminders / Finder / Music, screenshots, clipboard. every file change is backed up, `/undo` reverts it.
 - **your telegram.** `/tg` shows a QR code in the terminal (half blocks), supports 2fa. then: "find the family chat, read the weekend plans, text mom that we are coming".
-- **account pool.** accounts live in `~/.bratcode-data`. the best usable account is picked automatically; when credits run out mid-answer the next one continues in the same project, seamlessly. add accounts with `/accounts` (sign in in a window, or import read-only from Chrome / Brave / Edge).
+- **account pool.** accounts live in `~/.bratcode-data`. the best usable account is picked automatically; when credits run out mid-answer the next one continues in the same project, seamlessly. add accounts with `/accounts` (sign in in a window, import read-only from Chrome / Brave / Edge, or pin your `claudehack` folder with `p` and pull its sessions with `c` — see below).
 - **live balance.** refreshed the moment you start typing a prompt, and again right after every request. the bottom line always shows it.
 - **side a / side b.** `A brat` runs sensitive actions (like sending a telegram message) immediately. `B demure` plans first and asks you with a card (`enter` allow, `esc` deny).
 

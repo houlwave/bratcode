@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { findBrowserExecutable, HOME, IS_MAC } from '../paths.js';
+import { findBrowserExecutable, HOME, IS_MAC, DEFAULT_CLAUDEHACK_DIR } from '../paths.js';
 import * as cfg from './config.js';
 import { fetchUserInfo } from './balance.js';
 
@@ -83,6 +83,61 @@ export function listBrowserProfiles() {
   return out;
 }
 
+// ---------------------------------------------------------------- 2b) import from a claudehack folder
+// claudehack (the Electron desktop app) is itself an Electron/Chromium app: it keeps its own
+// accounts.json plus one real Chromium profile per account under <folder>/Partitions/account_<id>/.
+// Each profile's Cookies db is encrypted exactly like a browser's, but the Keychain item is named
+// after the app's productName ("Claude Safe Storage" / account "Claude") instead of a browser name.
+// We read it the same read-only way: never touch the app's files, never run while it's open.
+export function detectClaudehackKeychainName(dir) {
+  // best-effort: the keychain service name is "<productName> Safe Storage"; claudehack's
+  // productName is "Claude", but let the caller override via BRATCODE_CLAUDEHACK_KEYCHAIN.
+  return process.env.BRATCODE_CLAUDEHACK_KEYCHAIN || 'Claude';
+}
+
+export function listClaudehackAccounts(dir) {
+  // reading accounts.json + locating each profile's Cookies file is just disk I/O,
+  // so this part works everywhere; only readClaudehackCookies() needs the macOS Keychain.
+  const root = String(dir || '').trim();
+  if (!root) return [];
+  const dbPath = path.join(root, 'accounts.json');
+  const partitionsRoot = path.join(root, 'Partitions');
+  let db;
+  try { db = JSON.parse(fs.readFileSync(dbPath, 'utf8')); } catch { throw new Error(`no accounts.json in ${root}`); }
+  const accounts = Array.isArray(db.accounts) ? db.accounts : [];
+  const out = [];
+  for (const a of accounts) {
+    if (!a || !a.id) continue;
+    const partDir = path.join(partitionsRoot, `account_${a.id}`);
+    const cookies = [path.join(partDir, 'Network', 'Cookies'), path.join(partDir, 'Cookies')].find((p) => fs.existsSync(p));
+    if (cookies) out.push({ id: a.id, name: a.name || a.email || a.id, email: a.email || '', cookies });
+  }
+  return out;
+}
+
+/** Read-only: decrypts one claudehack account's Cookies db via its app Keychain item. */
+export function readClaudehackCookies(entry, keychainName) {
+  if (!IS_MAC) throw new Error('claudehack import works on macOS only');
+  return readGensparkCookies({ keychain: keychainName || detectClaudehackKeychainName(), cookies: entry.cookies });
+}
+
+/** Import every account from a claudehack userData folder (read-only, never touches claudehack's files). */
+export async function importFromClaudehackDir(store, dir, { onStatus } = {}) {
+  const entries = listClaudehackAccounts(dir);
+  const keychain = detectClaudehackKeychainName(dir);
+  const added = [], failed = [];
+  for (const e of entries) {
+    onStatus?.(e.name);
+    try {
+      const cookies = readClaudehackCookies(e, keychain);
+      if (!cfg.hasAuthCookie(cookies)) { failed.push({ from: e.name, error: 'no session cookie (logged out?)' }); continue; }
+      const r = await addFromCookies(store, cookies);
+      added.push({ ...r, from: e.name });
+    } catch (err) { failed.push({ from: e.name, error: String(err.message || err) }); }
+  }
+  return { added, failed, scanned: entries.length };
+}
+
 // Chromium on macOS: v10 + AES-128-CBC, key = PBKDF2(keychain password, 'saltysalt', 1003, 16), iv = 16 spaces.
 export function decryptChromiumCookie(buf, key, dbVersion = 0) {
   if (!buf || buf.length < 4) return '';
@@ -148,4 +203,9 @@ export async function importFromFile(store, file) {
     return { added, failed: [] };
   }
   throw new Error('unknown file format');
+}
+
+/** True-ish check that a folder looks like a claudehack userData dir (accounts.json present). */
+export function looksLikeClaudehackDir(dir) {
+  try { return fs.existsSync(path.join(String(dir || ''), 'accounts.json')); } catch { return false; }
 }
